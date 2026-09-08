@@ -83,6 +83,27 @@ enum Patches {
             name: "turns", selector: "[data-turn-index].max-w-4xl",
             declarations: "max-width:none",
             evidence: ["max-w-4xl", "mx-auto"], literals: ["data-turn-index"]),
+        // The one-line preview on a collapsed tool row -- Thinking, Bash, Error and the
+        // rest. It ships with a literal `max-w-[400px]`, so previews ellipsised a third of
+        // the way across the panel however wide the window was, which is the same
+        // complaint as the column itself but hard-coded in pixels rather than inherited.
+        //
+        // Two components render this row and they list the classes in different orders
+        // (`font-mono font-medium text-xs truncate max-w-[400px]` and `max-w-[400px]
+        // truncate font-mono text-xs font-medium ...`); a combination selector is
+        // order-independent so one rule covers both. The five classes also exclude the
+        // third user of `max-w-[400px]`, an unrelated dialog that should stay 400px.
+        //
+        // `flex:1 1 0%` matters as much as removing the cap. The preview and the row's
+        // label are siblings in a flex row, so dropping the cap alone would let flexbox
+        // shrink both in proportion to their content and clip the label to "Thin...".
+        // Zero basis lets the label keep its natural width and the preview absorb the rest.
+        StyleRule(
+            name: "tool row preview",
+            selector: #".font-mono.font-medium.text-xs.truncate.max-w-\[400px\]"#,
+            declarations: "max-width:none;flex:1 1 0%;min-width:0",
+            evidence: ["font-mono", "font-medium", "text-xs", "truncate", "max-w-[400px]"],
+            literals: []),
         // Scroll-to-bottom bar.
         StyleRule(
             name: "scroll-to-bottom", selector: ".pb-2.px-4.max-w-4xl.mx-auto",
