@@ -22,6 +22,7 @@ enum Patches {
         var widenTranscript = true
         var widenBubbles = true
         var brightenRepoLabels = true
+        var bandRepoGroups = true
         var qualifyRepoNames = true
     }
 
@@ -100,6 +101,33 @@ enum Patches {
     ]
 
     static let sidebarRules: [StyleRule] = [
+        // Alternating bands, one per repository group.
+        //
+        // No JavaScript required, because the DOM already has exactly the right shape: the
+        // repo list is a @hello-pangea/dnd droppable whose id is "repo-list", each group is
+        // one draggable child of it, and each of those wraps the header *and* its sessions.
+        // So tinting every other child gives banded groups for free, and a group's sessions
+        // inherit their header's band rather than needing to be matched separately. When
+        // every repo is collapsed each group is one row, so it degrades to alternating rows.
+        //
+        // Keyed on the library's data attributes rather than utility classes: `repo-list`
+        // is a semantic identifier the Conductor authors chose, and churns far less than
+        // Tailwind soup.
+        //
+        // color-mix against --sidebar-foreground rather than a literal rgba keeps the tint
+        // the right polarity in both themes: that token is white at 90% in the dark theme
+        // and near-black at 70% in the light one, so the band lifts in one and darkens in
+        // the other. 5% of it lands just under the 5% flat white of --sidebar-accent, which
+        // is the row hover colour, so hover still reads on a banded group.
+        StyleRule(
+            name: "repo group banding",
+            selector: "[data-rfd-droppable-id='repo-list']>[data-rfd-draggable-id]:nth-child(even)",
+            declarations:
+                "background:color-mix(in srgb,var(--sidebar-foreground) 5%,transparent)"
+                + ";border-radius:6px",
+            evidence: [],
+            literals: ["repo-list", "data-rfd-draggable-id"]),
+
         // The repository group header, lifted out of the muted palette.
         //
         // It ships as `--sidebar-muted-foreground`, which is white at 60% in the dark
@@ -146,12 +174,19 @@ enum Patches {
                 PatchOutcome(name: "message bubbles", status: .disabled, detail: "--no-widen-bubbles"))
         }
         if options.brightenRepoLabels {
-            rules += sidebarRules
+            rules += sidebarRules.filter { $0.name != "repo group banding" }
         } else {
             outcomes.append(
                 PatchOutcome(
                     name: "repo label colour", status: .disabled,
                     detail: "--no-brighten-repos"))
+        }
+        if options.bandRepoGroups {
+            rules += sidebarRules.filter { $0.name == "repo group banding" }
+        } else {
+            outcomes.append(
+                PatchOutcome(
+                    name: "repo group banding", status: .disabled, detail: "--no-band-repos"))
         }
         guard !rules.isEmpty else { return outcomes }
 
