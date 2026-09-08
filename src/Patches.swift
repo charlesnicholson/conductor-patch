@@ -21,6 +21,7 @@ enum Patches {
     struct Options {
         var widenTranscript = true
         var widenBubbles = true
+        var boldRepoLabels = true
         var qualifyRepoNames = true
     }
 
@@ -50,9 +51,11 @@ enum Patches {
     // `@layer utilities`, and unlayered rules beat layered ones outright, so an appended
     // unlayered rule takes precedence however the layers are ordered.
 
-    struct WidthRule {
+    struct StyleRule {
         let name: String
         let selector: String
+        /// The declaration body, without braces.
+        let declarations: String
         /// Class tokens that must still co-occur in one className literal in the bundle.
         /// Not needed to apply the rule -- appending always succeeds -- but without this
         /// the patch could silently stop matching anything and just look wrong.
@@ -61,40 +64,64 @@ enum Patches {
         let literals: [String]
     }
 
-    static let transcriptRules: [WidthRule] = [
+    static let transcriptRules: [StyleRule] = [
         // Turn body, session header, empty states, loading skeleton.
-        WidthRule(
+        StyleRule(
             name: "session columns", selector: ".max-w-4xl.mx-auto.px-7",
+            declarations: "max-width:none",
             evidence: ["max-w-4xl", "mx-auto", "px-7"], literals: []),
         // Composer, local and cloud workspaces.
-        WidthRule(
+        StyleRule(
             name: "composer", selector: ".max-w-4xl.mx-auto.relative.pointer-events-auto",
+            declarations: "max-width:none",
             evidence: ["max-w-4xl", "mx-auto", "relative", "pointer-events-auto"], literals: []),
         // Per-turn wrapper. Anchored on the data attribute rather than `.pb-3.max-w-4xl
         // .mx-auto`, which also matches the workspace-list and routines page headers --
         // and a semantic attribute churns far less than a utility class.
-        WidthRule(
+        StyleRule(
             name: "turns", selector: "[data-turn-index].max-w-4xl",
+            declarations: "max-width:none",
             evidence: ["max-w-4xl", "mx-auto"], literals: ["data-turn-index"]),
         // Scroll-to-bottom bar.
-        WidthRule(
+        StyleRule(
             name: "scroll-to-bottom", selector: ".pb-2.px-4.max-w-4xl.mx-auto",
+            declarations: "max-width:none",
             evidence: ["pb-2", "px-4", "max-w-4xl", "mx-auto"], literals: []),
     ]
 
-    static let bubbleRules: [WidthRule] = [
+    static let bubbleRules: [StyleRule] = [
         // Your own message bubbles and the system-summary blocks. Without this the outer
         // column goes full width but the contents stop at 48rem, which moves the empty
         // space rather than removing it.
-        WidthRule(
+        StyleRule(
             name: "message bubbles", selector: #".max-w-xl.lg\:max-w-3xl"#,
+            declarations: "max-width:none",
             evidence: ["max-w-xl", "lg:max-w-3xl"], literals: []),
     ]
 
+    static let sidebarRules: [StyleRule] = [
+        // The repository group header. Sessions beneath it are also font-medium, so
+        // weight is what separates the two levels; the header keeps its muted colour.
+        // `font-sans` is the discriminator -- it is the only sidebar element pairing that
+        // with `font-medium`, so the three-class selector is unique without pinning the
+        // layout utilities that are likelier to churn.
+        StyleRule(
+            name: "repo label weight",
+            selector: ".font-sans.font-medium.text-sidebar-muted-foreground",
+            declarations: "font-weight:700",
+            evidence: ["font-sans", "font-medium", "text-sidebar-muted-foreground"],
+            literals: []),
+    ]
+
+    /// Every style rule, for reporting.
+    static var allStyleRules: [StyleRule] { transcriptRules + bubbleRules + sidebarRules }
+
     // MARK: - Stylesheet patch
 
-    static func widen(stylesheet: inout Data, script: Data, options: Options) -> [PatchOutcome] {
-        var rules: [WidthRule] = []
+    static func injectStyles(stylesheet: inout Data, script: Data, options: Options)
+        -> [PatchOutcome]
+    {
+        var rules: [StyleRule] = []
         var outcomes: [PatchOutcome] = []
 
         if options.widenTranscript {
@@ -108,6 +135,12 @@ enum Patches {
         } else {
             outcomes.append(
                 PatchOutcome(name: "message bubbles", status: .disabled, detail: "--no-widen-bubbles"))
+        }
+        if options.boldRepoLabels {
+            rules += sidebarRules
+        } else {
+            outcomes.append(
+                PatchOutcome(name: "repo label weight", status: .disabled, detail: "--no-bold-repos"))
         }
         guard !rules.isEmpty else { return outcomes }
 
@@ -127,7 +160,7 @@ enum Patches {
         // it in place means a Conductor release that merely renames a sibling class can
         // start working again on its own.
         var css = "\n\(marker)"
-        for rule in rules { css += "\n\(rule.selector){max-width:none}" }
+        for rule in rules { css += "\n\(rule.selector){\(rule.declarations)}" }
         css += "\n"
         stylesheet.append(Data(css.utf8))
 
@@ -135,7 +168,7 @@ enum Patches {
     }
 
     /// True when some className literal in the bundle still carries all of a rule's tokens.
-    static func evidenceFound(for rule: WidthRule, in script: Data) -> Bool {
+    static func evidenceFound(for rule: StyleRule, in script: Data) -> Bool {
         for literal in rule.literals where script.occurrences(of: Data(literal.utf8)).isEmpty {
             return false
         }

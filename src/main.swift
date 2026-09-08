@@ -28,6 +28,7 @@ struct Options {
           --keep                 do not delete the clone on exit
           --no-widen-transcript  leave the chat column capped at max-w-4xl
           --no-widen-bubbles     leave your own message bubbles capped at lg:max-w-3xl
+          --no-bold-repos        leave sidebar repository labels at their normal weight
           --no-repo-names        leave sidebar groups showing the bare repository name
           --cli / --gui          force terminal or menu-bar mode (default: by isatty)
           -v, --verbose          more detail
@@ -43,6 +44,7 @@ struct Options {
             case "--keep": options.keepBundle = true
             case "--no-widen-transcript": options.patches.widenTranscript = false
             case "--no-widen-bubbles": options.patches.widenBubbles = false
+            case "--no-bold-repos": options.patches.boldRepoLabels = false
             case "--no-repo-names": options.patches.qualifyRepoNames = false
             case "--cli": options.forceCLI = true
             case "--gui": options.forceGUI = true

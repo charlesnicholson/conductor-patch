@@ -207,7 +207,7 @@ enum Pipeline {
 
         // Widths, via rules appended to the stylesheet.
         if var stylesheet = frontend.stylesheet?.content, let entry = frontend.stylesheet?.entry {
-            let widthOutcomes = Patches.widen(
+            let widthOutcomes = Patches.injectStyles(
                 stylesheet: &stylesheet, script: corpus, options: options)
             outcomes += widthOutcomes
             if widthOutcomes.contains(where: { $0.status != .disabled }) {
@@ -380,7 +380,7 @@ enum Pipeline {
             print("  (no application JavaScript found; nothing to check)")
             return
         }
-        for rule in Patches.transcriptRules + Patches.bubbleRules {
+        for rule in Patches.allStyleRules {
             let ok = Patches.evidenceFound(for: rule, in: corpus)
             print("  \(ok ? "ok     " : "MISSING")  \(rule.name): \(rule.selector)")
         }
