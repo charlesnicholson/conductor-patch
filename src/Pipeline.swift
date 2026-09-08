@@ -67,6 +67,14 @@ enum Pipeline {
             throw PatchError("refusing to delete \(path): does not look like our work bundle")
         }
 
+        // Never yank a bundle out from under a live process: the executable is mapped, but
+        // the sidecars in Resources/bin are re-exec'd on demand and would vanish.
+        let running = Launcher.processes(under: Paths.work)
+        guard running.isEmpty else {
+            throw PatchError(
+                "refusing to delete \(path): \(running.count) process(es) still running from it")
+        }
+
         try manager.removeItem(at: Paths.work)
         Log.debug("removed stale work bundle at \(path)")
     }

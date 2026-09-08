@@ -28,7 +28,7 @@ struct Options {
           --keep                 do not delete the clone on exit
           --no-widen-transcript  leave the chat column capped at max-w-4xl
           --no-widen-bubbles     leave your own message bubbles capped at lg:max-w-3xl
-          --no-bold-repos        leave sidebar repository labels at their normal weight
+          --no-brighten-repos    leave sidebar repository labels in the muted palette
           --no-repo-names        leave sidebar groups showing the bare repository name
           --cli / --gui          force terminal or menu-bar mode (default: by isatty)
           -v, --verbose          more detail
@@ -44,7 +44,7 @@ struct Options {
             case "--keep": options.keepBundle = true
             case "--no-widen-transcript": options.patches.widenTranscript = false
             case "--no-widen-bubbles": options.patches.widenBubbles = false
-            case "--no-bold-repos": options.patches.boldRepoLabels = false
+            case "--no-brighten-repos": options.patches.brightenRepoLabels = false
             case "--no-repo-names": options.patches.qualifyRepoNames = false
             case "--cli": options.forceCLI = true
             case "--gui": options.forceGUI = true
@@ -67,6 +67,10 @@ final class Runner {
     private let options: Options
     private let lock = NSLock()
     private var toreDown = false
+    /// Only ever terminate a Conductor this process started. Teardown used to kill
+    /// anything running out of the work bundle unconditionally, which meant a --no-launch
+    /// run -- which starts nothing -- would still shoot down a session already in flight.
+    private var didLaunch = false
 
     init(_ options: Options) { self.options = options }
 
@@ -101,6 +105,9 @@ final class Runner {
         Log.step("Launching Conductor")
         Launcher.registerWithLaunchServices()
         try Launcher.launch()
+        lock.lock()
+        didLaunch = true
+        lock.unlock()
 
         Log.step("Running")
         Launcher.waitForExit()
@@ -133,10 +140,13 @@ final class Runner {
             return
         }
         toreDown = true
+        let launched = didLaunch
         lock.unlock()
 
-        Launcher.terminateAll()
-        Launcher.unregisterFromLaunchServices()
+        if launched {
+            Launcher.terminateAll()
+            Launcher.unregisterFromLaunchServices()
+        }
 
         // Order matters: adopt first, because adopting consumes the bundle and there is
         // then nothing left to delete.

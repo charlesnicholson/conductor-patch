@@ -21,7 +21,7 @@ enum Patches {
     struct Options {
         var widenTranscript = true
         var widenBubbles = true
-        var boldRepoLabels = true
+        var brightenRepoLabels = true
         var qualifyRepoNames = true
     }
 
@@ -100,15 +100,24 @@ enum Patches {
     ]
 
     static let sidebarRules: [StyleRule] = [
-        // The repository group header. Sessions beneath it are also font-medium, so
-        // weight is what separates the two levels; the header keeps its muted colour.
-        // `font-sans` is the discriminator -- it is the only sidebar element pairing that
-        // with `font-medium`, so the three-class selector is unique without pinning the
+        // The repository group header, lifted out of the muted palette.
+        //
+        // It ships as `--sidebar-muted-foreground`, which is white at 60% in the dark
+        // theme -- dimmer than the session rows beneath it, which inherit the full
+        // `--sidebar-foreground`. Promoting the header to that same token is a 30-point
+        // jump in alpha and reads as a heading without adding weight, which at 700 just
+        // made the panel busy.
+        //
+        // Using the token rather than a literal colour keeps it correct in the light
+        // theme too, where the same pair is #14100f at 60% and 70%.
+        //
+        // `font-sans` is the discriminator: the header is the only sidebar element pairing
+        // it with `font-medium`, so three classes identify it uniquely without pinning the
         // layout utilities that are likelier to churn.
         StyleRule(
-            name: "repo label weight",
+            name: "repo label colour",
             selector: ".font-sans.font-medium.text-sidebar-muted-foreground",
-            declarations: "font-weight:700",
+            declarations: "color:var(--sidebar-foreground)",
             evidence: ["font-sans", "font-medium", "text-sidebar-muted-foreground"],
             literals: []),
     ]
@@ -136,11 +145,13 @@ enum Patches {
             outcomes.append(
                 PatchOutcome(name: "message bubbles", status: .disabled, detail: "--no-widen-bubbles"))
         }
-        if options.boldRepoLabels {
+        if options.brightenRepoLabels {
             rules += sidebarRules
         } else {
             outcomes.append(
-                PatchOutcome(name: "repo label weight", status: .disabled, detail: "--no-bold-repos"))
+                PatchOutcome(
+                    name: "repo label colour", status: .disabled,
+                    detail: "--no-brighten-repos"))
         }
         guard !rules.isEmpty else { return outcomes }
 
