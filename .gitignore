@@ -1,0 +1,8 @@
+# envy's project-local cache (@envy cache-local ".envy"). Disposable: `bin/envy sync`
+# rebuilds it.
+.envy/
+
+# Build output: the compiled tool and the assembled app bundle.
+out/
+
+.DS_Store

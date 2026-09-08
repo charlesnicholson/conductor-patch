@@ -1,0 +1,24 @@
+{
+  "$schema": "https:\/\/raw.githubusercontent.com\/LuaLS\/vscode-lua\/master\/setting\/schema.json",
+  "completion.enable": true,
+  "diagnostics.globals": [
+    "envy",
+    "IDENTITY",
+    "PACKAGES",
+    "DEPENDENCIES",
+    "PRODUCTS",
+    "FETCH",
+    "STAGE",
+    "BUILD",
+    "INSTALL",
+    "SETUP",
+    "ENVY_IMPORTER"
+  ],
+  "runtime.version": "Lua 5.4",
+  "workspace.library": [
+    ".envy\/envy\/0.3.1",
+    "~\/Library\/Caches\/envy\/envy\/0.3.1",
+    "~\/.cache\/envy\/envy\/0.3.1",
+    "${env:USERPROFILE}\/AppData\/Local\/envy\/envy\/0.3.1"
+  ]
+}
