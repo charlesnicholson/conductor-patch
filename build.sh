@@ -50,8 +50,22 @@ xcrun swiftc \
 
 echo "==> bundle"
 rm -rf "$APP"
-mkdir -p "$APP/Contents/MacOS"
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 mv "$OUT/$EXECUTABLE" "$APP/Contents/MacOS/$EXECUTABLE"
+
+# The icon is Conductor's own with a wrench badged on, so it needs Conductor installed to
+# derive from. Skipped rather than fatal when it is not: the tool would have nothing to
+# patch either way, but a missing icon should not stop you building.
+SOURCE_ICON=/Applications/Conductor.app/Contents/Resources/icon.icns
+ICON_PLIST_KEY=""
+if [ -f "$SOURCE_ICON" ]; then
+    echo "==> icon"
+    xcrun swift "$ROOT/tools/make-icon.swift" "$SOURCE_ICON" "$OUT/AppIcon.iconset"
+    iconutil -c icns "$OUT/AppIcon.iconset" -o "$APP/Contents/Resources/AppIcon.icns"
+    ICON_PLIST_KEY='    <key>CFBundleIconFile</key>                 <string>AppIcon</string>'
+else
+    echo "warning: $SOURCE_ICON not found; building without an icon" >&2
+fi
 
 # LSUIElement: this is an agent. It has no windows of its own, it lives in the menu bar
 # for the length of the Conductor session, and a Dock tile next to Conductor's would only
@@ -64,6 +78,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <key>CFBundleDevelopmentRegion</key>        <string>en</string>
     <key>CFBundleDisplayName</key>              <string>$APP_NAME</string>
     <key>CFBundleExecutable</key>               <string>$EXECUTABLE</string>
+$ICON_PLIST_KEY
     <key>CFBundleIdentifier</key>               <string>$BUNDLE_ID</string>
     <key>CFBundleInfoDictionaryVersion</key>    <string>6.0</string>
     <key>CFBundleName</key>                     <string>$APP_NAME</string>
@@ -88,5 +103,9 @@ if [ "$INSTALL" = yes ]; then
     echo "==> install"
     rm -rf "/Applications/$APP_NAME.app"
     cp -c -R "$APP" "/Applications/$APP_NAME.app"
+    # Re-register so Finder, Spotlight and the Dock pick up the new icon instead of a
+    # cached one from a previous install at the same path.
+    /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister \
+        -f "/Applications/$APP_NAME.app" || true
     echo "installed /Applications/$APP_NAME.app"
 fi
