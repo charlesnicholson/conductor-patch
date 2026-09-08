@@ -24,6 +24,51 @@ enum Paths {
     }
 }
 
+/// The decoded frontend: every asset that decompresses, plus the ones the patches care
+/// about, each located independently.
+struct Frontend {
+    let entries: [AssetEntry]
+    let decoded: [(entry: AssetEntry, content: Data)]
+    let usedFallback: Bool
+
+    var decodableLabels: Set<String> { Set(decoded.map { $0.entry.label }) }
+
+    func first(containingAny needles: [String]) -> (entry: AssetEntry, content: Data)? {
+        for needle in needles {
+            let target = Data(needle.utf8)
+            if let hit = decoded.first(where: { $0.content.range(of: target) != nil }) {
+                return hit
+            }
+        }
+        return nil
+    }
+
+    /// The stylesheet. Filename first, content second -- Vite has always emitted one
+    /// `.css` asset here, but the anchors mean a rename or a split does not matter.
+    var stylesheet: (entry: AssetEntry, content: Data)? {
+        decoded.first { $0.entry.key.hasSuffix(".css") }
+            ?? first(containingAny: Patches.stylesheetAnchors)
+    }
+
+    /// The biggest chunk of application JavaScript, used only as the corpus for checking
+    /// that the CSS rules still have something to match.
+    var mainScript: (entry: AssetEntry, content: Data)? {
+        decoded
+            .filter { entry, content in
+                entry.key.hasSuffix(".js")
+                    || Patches.scriptAnchors.contains { content.range(of: Data($0.utf8)) != nil }
+            }
+            .max { $0.content.count < $1.content.count }
+    }
+
+    /// Whichever asset still contains the sidebar header assignment. Searched across all
+    /// of them rather than assuming it lives in the main chunk, since Vite is free to
+    /// split it out at any time.
+    var sidebarHost: (entry: AssetEntry, content: Data)? {
+        decoded.first { Patches.findHeader(in: $0.content) != nil }
+    }
+}
+
 enum Pipeline {
     // MARK: - Bundle lifecycle
 
@@ -75,72 +120,170 @@ enum Pipeline {
         return version
     }
 
+    // MARK: - Discovery
+
+    /// Decodes every embedded asset so each patch can find its own target.
+    ///
+    /// Keyed table first; if that yields neither a stylesheet nor a script, retry over raw
+    /// `(pointer, length)` pairs, which assumes nothing about the record layout.
+    static func locate(in image: Data, macho: MachOImage) throws -> Frontend {
+        let table = try AssetTable(macho)
+        Log.debug(
+            "pointers: \(macho.hasChainedFixups ? "chained fixups" : "classic rebases"), "
+                + "image base 0x\(String(macho.imageBase, radix: 16))")
+
+        let entries = table.entries(in: image)
+        Log.info("asset table: \(entries.count) keyed entries")
+
+        var frontend = Frontend(
+            entries: entries, decoded: decode(entries, in: image), usedFallback: false)
+
+        if frontend.stylesheet == nil || frontend.mainScript == nil {
+            Log.warn("keyed asset scan came up short; falling back to a raw slice scan")
+            let slices = table.slices(in: image)
+            Log.info("raw slice scan: \(slices.count) candidates")
+            frontend = Frontend(
+                entries: entries, decoded: decode(slices, in: image), usedFallback: true)
+        }
+        return frontend
+    }
+
+    private static func decode(_ entries: [AssetEntry], in image: Data)
+        -> [(entry: AssetEntry, content: Data)]
+    {
+        entries.compactMap { entry in
+            (try? Brotli.decompress(image[entry.dataRange])).map { (entry, $0) }
+        }
+    }
+
     // MARK: - Patching
 
     /// Rewrites the cloned executable in place, then re-signs the bundle.
-    static func patch(options: Patches.Options) throws {
+    ///
+    /// Returns what did and did not apply. Only a structural failure -- no assets at all,
+    /// a blob that will not fit, a broken integrity sweep -- throws; a patch whose anchor
+    /// has moved is reported and skipped so the rest still land.
+    @discardableResult
+    static func patch(options: Patches.Options) throws -> [PatchOutcome] {
         let executable = Paths.executable(in: Paths.work)
         var image = try Data(contentsOf: executable)
         Log.debug("read \(humanBytes(image.count)) executable")
 
         let macho = try MachOImage(image)
-        let table = try AssetTable(macho)
+        let frontend = try locate(in: image, macho: macho)
 
-        let entries = table.entries(in: image)
-        guard entries.count > 500 else {
-            throw PatchError(
-                "found only \(entries.count) embedded assets; this does not look like the "
-                    + "Tauri asset table")
+        guard let corpus = frontend.mainScript?.content else {
+            throw PatchError("could not find any application JavaScript in the asset table")
         }
-        Log.info("asset table: \(entries.count) entries")
+        guard !frontend.decoded.contains(where: { Patches.alreadyPatched($0.content) }) else {
+            throw PatchError("this image is already patched; refusing to patch it twice")
+        }
 
-        let before = decompressible(entries, in: image)
-        Log.debug("\(before.count) of \(entries.count) entries decompress before patching")
+        let before = frontend.decodableLabels
+        Log.debug("\(before.count) of \(frontend.entries.count) entries decode before patching")
 
-        let script = try AssetTable.unique(
-            entries,
-            matching: #"^/assets/renderApp-[A-Za-z0-9_-]+\.js$"#,
-            describedAs: "main script")
+        var outcomes: [PatchOutcome] = []
 
-        var source = try Brotli.decompress(image[script.dataRange])
-        Log.info(
-            "\(script.key): \(humanBytes(script.dataLength)) compressed, "
-                + "\(humanBytes(source.count)) source")
+        // Widths, via rules appended to the stylesheet.
+        if var stylesheet = frontend.stylesheet?.content, let entry = frontend.stylesheet?.entry {
+            let widthOutcomes = Patches.widen(
+                stylesheet: &stylesheet, script: corpus, options: options)
+            outcomes += widthOutcomes
+            if widthOutcomes.contains(where: { $0.status != .disabled }) {
+                try recompress(stylesheet, into: &image, at: entry)
+            }
+        } else {
+            outcomes.append(
+                PatchOutcome(
+                    name: "chat column", status: .missing, detail: "no stylesheet asset found"))
+        }
 
-        try Patches.apply(to: &source, options: options)
-
-        let recompressed = try Brotli.compress(source)
-        Log.info(
-            "recompressed to \(humanBytes(recompressed.count)) "
-                + "(slot holds \(humanBytes(script.dataLength)))")
-        try image.writeAsset(recompressed, to: script)
+        // Sidebar repository names, in whichever chunk still carries the header.
+        if options.qualifyRepoNames {
+            if var host = frontend.sidebarHost?.content, let entry = frontend.sidebarHost?.entry {
+                let outcome = Patches.qualifyRepoNames(in: &host, options: options)
+                outcomes.append(outcome)
+                if outcome.status == .applied { try recompress(host, into: &image, at: entry) }
+            } else {
+                outcomes.append(
+                    PatchOutcome(
+                        name: "repository names", status: .missing,
+                        detail: "no asset contains the sidebar header assignment"))
+            }
+        } else {
+            outcomes.append(
+                PatchOutcome(
+                    name: "repository names", status: .disabled, detail: "--no-repo-names"))
+        }
 
         // Verify against the freshly written image rather than the in-memory expectation:
-        // this catches a bad length field or an off-by-one in the write, which is exactly
-        // the class of bug that would otherwise surface as a blank window at runtime.
-        let after = decompressible(table.entries(in: image), in: image)
+        // this catches a bad length field or an off-by-one in the write, the class of bug
+        // that would otherwise surface as a blank window at runtime.
+        let table = try AssetTable(macho)
+        let after = Set(decode(table.entries(in: image), in: image).map { $0.entry.label })
         guard after == before else {
-            let broken = before.subtracting(after).sorted()
-            let appeared = after.subtracting(before).sorted()
             throw PatchError(
-                "integrity check failed after patching. broken: \(broken.prefix(5)), "
-                    + "new: \(appeared.prefix(5))")
+                "integrity check failed after patching; broken assets: "
+                    + "\(before.subtracting(after).sorted().prefix(5))")
         }
         Log.info("integrity: all \(after.count) decodable assets still decode")
 
         try image.write(to: executable, options: .atomic)
         try sign()
+        return outcomes
     }
 
-    /// Keys of every entry whose blob decodes. A couple of unrelated constants pass the
-    /// structural filter and never decode; comparing the set before and after keeps them
-    /// from being mistaken for damage.
-    private static func decompressible(_ entries: [AssetEntry], in image: Data) -> Set<String> {
-        var good = Set<String>()
-        for entry in entries where (try? Brotli.decompress(image[entry.dataRange])) != nil {
-            good.insert(entry.key)
+    private static func recompress(_ content: Data, into image: inout Data, at entry: AssetEntry)
+        throws
+    {
+        let blob = try Brotli.compress(content)
+        Log.info(
+            "\(entry.label): \(humanBytes(content.count)) source -> \(humanBytes(blob.count)) "
+                + "(slot holds \(humanBytes(entry.dataLength)))")
+        try image.writeAsset(blob, to: entry)
+    }
+
+    // MARK: - Doctor
+
+    /// Reports what the patcher can still find, without cloning, patching or signing.
+    static func doctor() throws {
+        let image = try Data(contentsOf: Paths.executable(in: Paths.source))
+        let macho = try MachOImage(image)
+
+        print("Conductor \(try bundleVersion(of: Paths.source))  \(Paths.source.path)")
+        print("  pointers          \(macho.hasChainedFixups ? "chained fixups" : "classic rebases")")
+
+        let frontend = try locate(in: image, macho: macho)
+        print("  keyed entries     \(frontend.entries.count)")
+        print("  decoded           \(frontend.decoded.count)")
+        print("  slice fallback    \(frontend.usedFallback ? "USED" : "not needed")")
+
+        func describe(_ label: String, _ located: (entry: AssetEntry, content: Data)?) {
+            let padded = label.padding(toLength: 18, withPad: " ", startingAt: 0)
+            guard let located else {
+                print("  \(padded)NOT FOUND")
+                return
+            }
+            print("  \(padded)\(located.entry.label)  \(humanBytes(located.content.count))")
         }
-        return good
+        describe("stylesheet", frontend.stylesheet)
+        describe("main script", frontend.mainScript)
+        describe("sidebar host", frontend.sidebarHost)
+
+        print("\nanchors")
+        guard let corpus = frontend.mainScript?.content else {
+            print("  (no application JavaScript found; nothing to check)")
+            return
+        }
+        for rule in Patches.transcriptRules + Patches.bubbleRules {
+            let ok = Patches.evidenceFound(for: rule, in: corpus)
+            print("  \(ok ? "ok     " : "MISSING")  \(rule.name): \(rule.selector)")
+        }
+        if let host = frontend.sidebarHost?.content, let header = Patches.findHeader(in: host) {
+            print("  ok       repository names: \(header.repoVariable).name")
+        } else {
+            print("  MISSING  repository names: sidebar header assignment not found")
+        }
     }
 
     // MARK: - Signing

@@ -10,6 +10,7 @@ struct Options {
     var keepBundle = false
     var forceCLI = false
     var forceGUI = false
+    var doctor = false
 
     static let usage = """
         conductor-qol - launch Conductor with quality-of-life patches applied.
@@ -22,6 +23,7 @@ struct Options {
 
         usage: conductor-qol [options]
 
+          --doctor               report which anchors still match, patch nothing, exit
           --no-launch            patch only; leave the clone in place and print its path
           --keep                 do not delete the clone on exit
           --no-widen-transcript  leave the chat column capped at max-w-4xl
@@ -36,6 +38,7 @@ struct Options {
         var options = Options()
         for argument in arguments {
             switch argument {
+            case "--doctor": options.doctor = true
             case "--no-launch": options.launch = false
             case "--keep": options.keepBundle = true
             case "--no-widen-transcript": options.patches.widenTranscript = false
@@ -83,7 +86,8 @@ final class Runner {
         Log.info("Conductor \(version)")
 
         Log.step("Patching")
-        try Pipeline.patch(options: options.patches)
+        let outcomes = try Pipeline.patch(options: options.patches)
+        report(outcomes)
 
         guard options.launch else {
             Log.step("Done (not launching)")
@@ -97,6 +101,24 @@ final class Runner {
 
         Log.step("Running")
         Launcher.waitForExit()
+    }
+
+    /// Patches are independent, so say plainly which landed. A `missing` line is the
+    /// signal to re-anchor; `--doctor` narrows it down.
+    private func report(_ outcomes: [PatchOutcome]) {
+        for outcome in outcomes {
+            switch outcome.status {
+            case .applied: Log.info("applied   \(outcome.name)")
+            case .disabled: Log.info("disabled  \(outcome.name) (\(outcome.detail))")
+            case .missing: Log.warn("MISSING   \(outcome.name): \(outcome.detail)")
+            }
+        }
+        let missing = outcomes.filter { $0.status == .missing }
+        if !missing.isEmpty {
+            Log.warn(
+                "\(missing.count) patch(es) no longer match this build of Conductor. "
+                    + "Launching anyway; run --doctor for detail.")
+        }
     }
 
     /// Idempotent teardown: safe to call from a signal source, the Quit item, or the
@@ -153,6 +175,16 @@ do {
 } catch {
     FileHandle.standardError.write(Data("error: \(error)\n".utf8))
     exit(2)
+}
+
+if options.doctor {
+    do {
+        try Pipeline.doctor()
+        exit(0)
+    } catch {
+        FileHandle.standardError.write(Data("error: \(error)\n".utf8))
+        exit(1)
+    }
 }
 
 let runner = Runner(options)
