@@ -88,6 +88,7 @@ final class Runner {
         Log.step("Patching")
         let outcomes = try Pipeline.patch(options: options.patches)
         report(outcomes)
+        Profile.shared.report()
 
         guard options.launch else {
             Log.step("Done (not launching)")

@@ -24,49 +24,26 @@ enum Paths {
     }
 }
 
-/// The decoded frontend: every asset that decompresses, plus the ones the patches care
-/// about, each located independently.
+/// The three assets the patches need, each located independently.
+///
+/// Resolved once at construction rather than as computed properties: each lookup scans
+/// decoded blobs, and `frontend.stylesheet?.content` plus `frontend.stylesheet?.entry` is
+/// two evaluations of the same search.
 struct Frontend {
     let entries: [AssetEntry]
-    let decoded: [(entry: AssetEntry, content: Data)]
     let usedFallback: Bool
+    let decodedCount: Int
 
-    var decodableLabels: Set<String> { Set(decoded.map { $0.entry.label }) }
+    /// Where the width rules are appended.
+    let stylesheet: (entry: AssetEntry, content: Data)?
+    /// The biggest chunk of application JavaScript; only the corpus for checking that the
+    /// CSS rules still have something to match.
+    let mainScript: (entry: AssetEntry, content: Data)?
+    /// Whichever asset still contains the sidebar header assignment -- searched for rather
+    /// than assumed to be the main chunk, since Vite is free to split it out.
+    let sidebarHost: (entry: AssetEntry, content: Data)?
 
-    func first(containingAny needles: [String]) -> (entry: AssetEntry, content: Data)? {
-        for needle in needles {
-            let target = Data(needle.utf8)
-            if let hit = decoded.first(where: { $0.content.range(of: target) != nil }) {
-                return hit
-            }
-        }
-        return nil
-    }
-
-    /// The stylesheet. Filename first, content second -- Vite has always emitted one
-    /// `.css` asset here, but the anchors mean a rename or a split does not matter.
-    var stylesheet: (entry: AssetEntry, content: Data)? {
-        decoded.first { $0.entry.key.hasSuffix(".css") }
-            ?? first(containingAny: Patches.stylesheetAnchors)
-    }
-
-    /// The biggest chunk of application JavaScript, used only as the corpus for checking
-    /// that the CSS rules still have something to match.
-    var mainScript: (entry: AssetEntry, content: Data)? {
-        decoded
-            .filter { entry, content in
-                entry.key.hasSuffix(".js")
-                    || Patches.scriptAnchors.contains { content.range(of: Data($0.utf8)) != nil }
-            }
-            .max { $0.content.count < $1.content.count }
-    }
-
-    /// Whichever asset still contains the sidebar header assignment. Searched across all
-    /// of them rather than assuming it lives in the main chunk, since Vite is free to
-    /// split it out at any time.
-    var sidebarHost: (entry: AssetEntry, content: Data)? {
-        decoded.first { Patches.findHeader(in: $0.content) != nil }
-    }
+    var isUsable: Bool { mainScript != nil }
 }
 
 enum Pipeline {
@@ -100,7 +77,9 @@ enum Pipeline {
         try FileManager.default.createDirectory(
             at: Paths.workDirectory, withIntermediateDirectories: true)
 
-        let result = clonefile(Paths.source.path, Paths.work.path, 0)
+        let result = Profile.shared.measure("clone bundle") {
+            clonefile(Paths.source.path, Paths.work.path, 0)
+        }
         guard result == 0 else {
             throw PatchError(
                 "clonefile(\(Paths.source.path) -> \(Paths.work.path)) failed: "
@@ -122,38 +101,77 @@ enum Pipeline {
 
     // MARK: - Discovery
 
-    /// Decodes every embedded asset so each patch can find its own target.
+    /// Finds the assets the patches need, decoding as few as possible.
     ///
-    /// Keyed table first; if that yields neither a stylesheet nor a script, retry over raw
-    /// `(pointer, length)` pairs, which assumes nothing about the record layout.
+    /// Assets are visited stylesheet-first then largest-first, because the two targets are
+    /// the one `.css` and the biggest `.js`, and the search stops as soon as all three are
+    /// in hand. In practice that is two blobs decoded instead of two thousand nine hundred.
     static func locate(in image: Data, macho: MachOImage) throws -> Frontend {
         let table = try AssetTable(macho)
         Log.debug(
             "pointers: \(macho.hasChainedFixups ? "chained fixups" : "classic rebases"), "
                 + "image base 0x\(String(macho.imageBase, radix: 16))")
 
-        let entries = table.entries(in: image)
+        let entries = Profile.shared.measure("scan asset table") { table.entries(in: image) }
         Log.info("asset table: \(entries.count) keyed entries")
 
-        var frontend = Frontend(
-            entries: entries, decoded: decode(entries, in: image), usedFallback: false)
-
-        if frontend.stylesheet == nil || frontend.mainScript == nil {
+        var frontend = Profile.shared.measure("decode assets") {
+            resolve(entries, in: image, usedFallback: false)
+        }
+        if !frontend.isUsable || frontend.stylesheet == nil {
             Log.warn("keyed asset scan came up short; falling back to a raw slice scan")
             let slices = table.slices(in: image)
             Log.info("raw slice scan: \(slices.count) candidates")
-            frontend = Frontend(
-                entries: entries, decoded: decode(slices, in: image), usedFallback: true)
+            frontend = Profile.shared.measure("decode assets (fallback)") {
+                resolve(slices, in: image, usedFallback: true)
+            }
         }
+        Log.debug("decoded \(frontend.decodedCount) asset(s) to locate targets")
         return frontend
     }
 
-    private static func decode(_ entries: [AssetEntry], in image: Data)
-        -> [(entry: AssetEntry, content: Data)]
+    private static func resolve(_ entries: [AssetEntry], in image: Data, usedFallback: Bool)
+        -> Frontend
     {
-        entries.compactMap { entry in
-            (try? Brotli.decompress(image[entry.dataRange])).map { (entry, $0) }
+        let ordered = entries.sorted { left, right in
+            let leftCSS = left.key.hasSuffix(".css"), rightCSS = right.key.hasSuffix(".css")
+            if leftCSS != rightCSS { return leftCSS }
+            return left.dataLength > right.dataLength
         }
+
+        func contains(_ content: Data, anyOf needles: [String]) -> Bool {
+            needles.contains { content.range(of: Data($0.utf8)) != nil }
+        }
+
+        var stylesheet: (entry: AssetEntry, content: Data)?
+        var mainScript: (entry: AssetEntry, content: Data)?
+        var sidebarHost: (entry: AssetEntry, content: Data)?
+        var decodedCount = 0
+
+        for entry in ordered {
+            if stylesheet != nil, mainScript != nil, sidebarHost != nil { break }
+            guard let content = try? Brotli.decompress(image[entry.dataRange]) else { continue }
+            decodedCount += 1
+
+            if stylesheet == nil,
+                entry.key.hasSuffix(".css") || contains(content, anyOf: Patches.stylesheetAnchors)
+            {
+                stylesheet = (entry, content)
+            }
+            // Size-descending order means the first JavaScript seen is the biggest.
+            if mainScript == nil,
+                entry.key.hasSuffix(".js") || contains(content, anyOf: Patches.scriptAnchors)
+            {
+                mainScript = (entry, content)
+            }
+            if sidebarHost == nil, Patches.findHeader(in: content) != nil {
+                sidebarHost = (entry, content)
+            }
+        }
+
+        return Frontend(
+            entries: entries, usedFallback: usedFallback, decodedCount: decodedCount,
+            stylesheet: stylesheet, mainScript: mainScript, sidebarHost: sidebarHost)
     }
 
     // MARK: - Patching
@@ -166,23 +184,26 @@ enum Pipeline {
     @discardableResult
     static func patch(options: Patches.Options) throws -> [PatchOutcome] {
         let executable = Paths.executable(in: Paths.work)
-        var image = try Data(contentsOf: executable)
+        var image = try Profile.shared.measure("read executable") { try Data(contentsOf: executable) }
         Log.debug("read \(humanBytes(image.count)) executable")
 
-        let macho = try MachOImage(image)
+        let macho = try Profile.shared.measure("parse Mach-O") { try MachOImage(image) }
         let frontend = try locate(in: image, macho: macho)
 
         guard let corpus = frontend.mainScript?.content else {
             throw PatchError("could not find any application JavaScript in the asset table")
         }
-        guard !frontend.decoded.contains(where: { Patches.alreadyPatched($0.content) }) else {
+        let targets = [frontend.stylesheet, frontend.mainScript, frontend.sidebarHost]
+        guard !targets.contains(where: { $0.map { Patches.alreadyPatched($0.content) } ?? false })
+        else {
             throw PatchError("this image is already patched; refusing to patch it twice")
         }
 
-        let before = frontend.decodableLabels
-        Log.debug("\(before.count) of \(frontend.entries.count) entries decode before patching")
+        // Copy-on-write snapshot, so this costs nothing until the first mutation below.
+        let original = image
 
         var outcomes: [PatchOutcome] = []
+        var pending: [(entry: AssetEntry, content: Data)] = []
 
         // Widths, via rules appended to the stylesheet.
         if var stylesheet = frontend.stylesheet?.content, let entry = frontend.stylesheet?.entry {
@@ -190,7 +211,7 @@ enum Pipeline {
                 stylesheet: &stylesheet, script: corpus, options: options)
             outcomes += widthOutcomes
             if widthOutcomes.contains(where: { $0.status != .disabled }) {
-                try recompress(stylesheet, into: &image, at: entry)
+                pending.append((entry, stylesheet))
             }
         } else {
             outcomes.append(
@@ -203,7 +224,7 @@ enum Pipeline {
             if var host = frontend.sidebarHost?.content, let entry = frontend.sidebarHost?.entry {
                 let outcome = Patches.qualifyRepoNames(in: &host, options: options)
                 outcomes.append(outcome)
-                if outcome.status == .applied { try recompress(host, into: &image, at: entry) }
+                if outcome.status == .applied { pending.append((entry, host)) }
             } else {
                 outcomes.append(
                     PatchOutcome(
@@ -216,31 +237,115 @@ enum Pipeline {
                     name: "repository names", status: .disabled, detail: "--no-repo-names"))
         }
 
-        // Verify against the freshly written image rather than the in-memory expectation:
-        // this catches a bad length field or an off-by-one in the write, the class of bug
-        // that would otherwise surface as a blank window at runtime.
-        let table = try AssetTable(macho)
-        let after = Set(decode(table.entries(in: image), in: image).map { $0.entry.label })
-        guard after == before else {
-            throw PatchError(
-                "integrity check failed after patching; broken assets: "
-                    + "\(before.subtracting(after).sorted().prefix(5))")
-        }
-        Log.info("integrity: all \(after.count) decodable assets still decode")
+        let written = try compressAll(pending)
+        for (entry, blob) in written { try image.writeAsset(blob, to: entry) }
 
-        try image.write(to: executable, options: .atomic)
+        try Profile.shared.measure("integrity check") {
+            try verify(original: original, patched: image, written: written)
+        }
+
+        try Profile.shared.measure("write executable") {
+            try image.write(to: executable, options: .atomic)
+        }
         try sign()
         return outcomes
     }
 
-    private static func recompress(_ content: Data, into image: inout Data, at entry: AssetEntry)
-        throws
-    {
-        let blob = try Brotli.compress(content)
+    /// Proves the patch touched nothing it did not mean to.
+    ///
+    /// Stronger than re-decoding every asset and about twenty times cheaper: rather than
+    /// checking that the other 2900 blobs still happen to decode, this checks that their
+    /// bytes are untouched, by memcmp-ing the gaps between the ranges we deliberately
+    /// wrote. Then it decodes the blobs we did write, out of the final image, and confirms
+    /// they reproduce exactly the content intended.
+    private static func verify(
+        original: Data, patched: Data, written: [(entry: AssetEntry, blob: Data)]
+    ) throws {
+        guard original.count == patched.count else {
+            throw PatchError("patched image changed size: \(original.count) -> \(patched.count)")
+        }
+
+        var allowed: [Range<Int>] = []
+        for (entry, _) in written {
+            allowed.append(entry.dataOffset ..< entry.dataOffset + entry.dataLength)
+            allowed.append(entry.lengthFieldOffset ..< entry.lengthFieldOffset + 8)
+        }
+        allowed.sort { $0.lowerBound < $1.lowerBound }
+
+        var gaps: [Range<Int>] = []
+        var cursor = 0
+        for range in allowed {
+            if range.lowerBound > cursor { gaps.append(cursor ..< range.lowerBound) }
+            cursor = max(cursor, range.upperBound)
+        }
+        if cursor < original.count { gaps.append(cursor ..< original.count) }
+
+        let identical = original.withUnsafeBytes { left in
+            patched.withUnsafeBytes { right -> Bool in
+                for gap in gaps
+                where memcmp(
+                    left.baseAddress! + gap.lowerBound, right.baseAddress! + gap.lowerBound,
+                    gap.count) != 0 {
+                    return false
+                }
+                return true
+            }
+        }
+        guard identical else {
+            throw PatchError("integrity check failed: bytes changed outside the patched assets")
+        }
+
+        for (entry, blob) in written {
+            let stored = patched[entry.dataOffset ..< entry.dataOffset + blob.count]
+            guard stored == blob else {
+                throw PatchError("\(entry.label): stored blob does not match what was compressed")
+            }
+            guard patched.u64(at: entry.lengthFieldOffset) == UInt64(blob.count) else {
+                throw PatchError("\(entry.label): length field does not match the stored blob")
+            }
+            _ = try Brotli.decompress(stored)
+        }
+
         Log.info(
-            "\(entry.label): \(humanBytes(content.count)) source -> \(humanBytes(blob.count)) "
-                + "(slot holds \(humanBytes(entry.dataLength)))")
-        try image.writeAsset(blob, to: entry)
+            "integrity: \(written.count) asset(s) rewritten, \(humanBytes(gaps.reduce(0) { $0 + $1.count })) "
+                + "of the image byte-identical")
+    }
+
+    /// Compresses every changed asset, in parallel, each only as hard as its slot demands.
+    ///
+    /// libbrotli's encoder is single-threaded and brotli streams cannot be concatenated,
+    /// so one asset cannot be split across cores -- but the stylesheet and the script can
+    /// compress at the same time, which is most of what there is to win here.
+    private static func compressAll(_ pending: [(entry: AssetEntry, content: Data)]) throws
+        -> [(entry: AssetEntry, blob: Data)]
+    {
+        guard !pending.isEmpty else { return [] }
+
+        var results = [Result<Data, Error>?](repeating: nil, count: pending.count)
+        let lock = NSLock()
+
+        Profile.shared.measure("compress assets") {
+            DispatchQueue.concurrentPerform(iterations: pending.count) { index in
+                let item = pending[index]
+                let outcome = Result {
+                    try Brotli.compressToFit(
+                        item.content, budget: item.entry.dataLength,
+                        describedAs: item.entry.label)
+                }
+                lock.lock()
+                results[index] = outcome
+                lock.unlock()
+            }
+        }
+
+        return try pending.indices.map { index in
+            let blob = try results[index]!.get()
+            let entry = pending[index].entry
+            Log.info(
+                "\(entry.label): \(humanBytes(pending[index].content.count)) source -> "
+                    + "\(humanBytes(blob.count)) (slot holds \(humanBytes(entry.dataLength)))")
+            return (entry, blob)
+        }
     }
 
     // MARK: - Doctor
@@ -255,7 +360,7 @@ enum Pipeline {
 
         let frontend = try locate(in: image, macho: macho)
         print("  keyed entries     \(frontend.entries.count)")
-        print("  decoded           \(frontend.decoded.count)")
+        print("  decoded           \(frontend.decodedCount) (of \(frontend.entries.count))")
         print("  slice fallback    \(frontend.usedFallback ? "USED" : "not needed")")
 
         func describe(_ label: String, _ located: (entry: AssetEntry, content: Data)?) {
@@ -309,8 +414,10 @@ enum Pipeline {
         }
         arguments.append(Paths.work.path)
 
-        try run("/usr/bin/codesign", arguments)
-        try run("/usr/bin/codesign", ["--verify", "--strict", Paths.work.path])
+        try Profile.shared.measure("codesign") { try run("/usr/bin/codesign", arguments) }
+        try Profile.shared.measure("codesign --verify") {
+            try run("/usr/bin/codesign", ["--verify", "--strict", Paths.work.path])
+        }
         Log.info("signed ad-hoc, hardened runtime preserved")
     }
 }

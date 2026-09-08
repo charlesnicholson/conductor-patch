@@ -215,7 +215,7 @@ enum Patches {
             return PatchOutcome(name: name, status: .disabled, detail: "--no-repo-names")
         }
 
-        guard let match = findHeader(in: script) else {
+        guard let match = Profile.shared.measure("find sidebar anchor", { findHeader(in: script) }) else {
             return PatchOutcome(
                 name: name, status: .missing,
                 detail: "sidebar header assignment not found near \(headerAnchor.debugDescription)")

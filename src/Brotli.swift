@@ -2,13 +2,18 @@ import Foundation
 
 /// Thin wrappers over the statically linked libbrotli.
 ///
-/// Quality 11 with a 22-bit window matches what Tauri's embedded assets decode as and
-/// costs about 13 s on Conductor's 11 MB main chunk -- fine, since this runs once per
-/// launch and the launch is the slow part anyway. A smaller window would also fit the
-/// budget; 22 is the conservative choice the Rust decoder in Tauri is certain to handle.
+/// Window size is 24 bits, the largest the standard format allows without the large-window
+/// extension, so any conforming decoder handles it. It is not a nicety: on Conductor's
+/// 11 MB main chunk, quality 9 at lgwin 22 overshoots the slot by 1055 bytes while the same
+/// quality at lgwin 24 comes in 20 KB under it -- the difference between a 0.7 s compress
+/// and a 13 s one.
 enum Brotli {
-    static let quality: Int32 = 11
-    static let windowBits: Int32 = 22
+    static let windowBits: Int32 = 24
+
+    /// Qualities to try, cheapest first. Compression is ~89% of a patch run's wall clock,
+    /// and the only thing that matters about the output is that it fits the slot it came
+    /// out of, so there is no reason to pay for quality 11 when 9 fits.
+    static let qualityLadder: [Int32] = [9, 10, 11]
 
     static func decompress(_ input: Data) throws -> Data {
         guard let state = BrotliDecoderCreateInstance(nil, nil, nil) else {
@@ -52,7 +57,34 @@ enum Brotli {
         }
     }
 
-    static func compress(_ input: Data) throws -> Data {
+    /// Compresses to fit `budget`, climbing the quality ladder only as far as needed.
+    ///
+    /// The result is decompressed and compared before being returned. That round trip
+    /// costs about a tenth of a second and is the last line of defence between an encoder
+    /// bug and a Conductor that launches to a blank window.
+    static func compressToFit(_ input: Data, budget: Int, describedAs label: String) throws -> Data
+    {
+        var last: Data?
+        for quality in qualityLadder {
+            let blob = try compress(input, quality: quality)
+            last = blob
+            if blob.count <= budget {
+                guard try decompress(blob) == input else {
+                    throw PatchError("\(label): brotli round trip did not reproduce the input")
+                }
+                Log.debug(
+                    "\(label): q\(quality) -> \(blob.count) bytes, \(budget - blob.count) spare")
+                return blob
+            }
+            Log.debug(
+                "\(label): q\(quality) -> \(blob.count) bytes, \(blob.count - budget) over budget")
+        }
+        throw PatchError(
+            "\(label): even quality \(qualityLadder.last ?? 11) produces "
+                + "\(last?.count ?? 0) bytes, over the \(budget)-byte slot")
+    }
+
+    static func compress(_ input: Data, quality: Int32 = 11) throws -> Data {
         var capacity = BrotliEncoderMaxCompressedSize(input.count)
         guard capacity > 0 else { throw PatchError("brotli: input too large to compress") }
         var output = [UInt8](repeating: 0, count: capacity)

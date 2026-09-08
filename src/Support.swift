@@ -37,6 +37,53 @@ enum Log {
     }
 }
 
+// MARK: - Profiling
+//
+// Wall-clock spans, printed as a table when --verbose is on. Deliberately crude: the
+// interesting costs here are seconds apart, not microseconds.
+
+final class Profile {
+    nonisolated(unsafe) static let shared = Profile()
+
+    private var spans: [(name: String, seconds: Double)] = []
+    private let lock = NSLock()
+    private let start = Date()
+
+    @discardableResult
+    func measure<T>(_ name: String, _ body: () throws -> T) rethrows -> T {
+        let began = Date()
+        defer {
+            let elapsed = Date().timeIntervalSince(began)
+            lock.lock()
+            spans.append((name, elapsed))
+            lock.unlock()
+        }
+        return try body()
+    }
+
+    func report() {
+        guard Log.verbose else { return }
+        lock.lock()
+        let recorded = spans
+        lock.unlock()
+        guard !recorded.isEmpty else { return }
+
+        let total = Date().timeIntervalSince(start)
+        let accounted = recorded.reduce(0) { $0 + $1.seconds }
+        var lines = ["", "  profile"]
+        for span in recorded.sorted(by: { $0.seconds > $1.seconds }) {
+            let share = total > 0 ? span.seconds / total * 100 : 0
+            lines.append(
+                String(
+                    format: "    %-28@ %7.3fs  %5.1f%%", span.name as NSString, span.seconds, share)
+            )
+        }
+        lines.append(String(format: "    %-28@ %7.3fs", "unaccounted" as NSString, total - accounted))
+        lines.append(String(format: "    %-28@ %7.3fs", "TOTAL" as NSString, total))
+        FileHandle.standardError.write(Data((lines.joined(separator: "\n") + "\n").utf8))
+    }
+}
+
 // MARK: - Little-endian scalar access
 //
 // The Mach-O structures and the asset table are all packed little-endian, and none of the
