@@ -31,4 +31,18 @@ Launch **Conductor QoL Patched** from Spotlight. Quit Conductor first — two in
 one `conductor.db`. The first launch re-prompts for microphone and folder access, because
 the ad-hoc signature is a different code identity from Conductor's Developer ID.
 
+## Password prompts
+
+macOS will ask for your login password several times per launch, and will ask again the
+next launch. Two separate reasons.
+
+Within a launch: every keychain item carries its own access list naming which code may
+read it. Conductor reads several — agent credentials, git tokens — so you get one prompt
+per item, not one per app.
+
+Across launches: an access list identifies code by its signature. The patched clone is
+signed ad-hoc, so its identity is just the hash of its own bytes, and the clone is rebuilt,
+patched and re-signed from scratch on every launch. The hash is new, so nothing you
+approved before matches. "Always Allow" grants access to a binary that is deleted on exit.
+
 Uninstall: `rm -rf "/Applications/Conductor QoL Patched.app" ~/Library/Caches/conductor-qol`
