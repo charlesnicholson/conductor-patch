@@ -9,14 +9,22 @@ Launches Conductor with quality-of-life patches applied. macOS, arm64.
 - Sidebar repository groups show `owner/repo`, with alternating background tints per group.
 
 `/Applications/Conductor.app` is never modified. Each launch clones it, patches the clone,
-ad-hoc re-signs it, launches that, and deletes it on exit. Auto-update keeps working; an
-update the clone installs is moved into `/Applications` rather than thrown away.
+ad-hoc re-signs it, launches that, and deletes it on exit.
+
+Auto-update keeps working. Conductor's updater installs the new release over the running
+clone and relaunches from it; the tool notices the version change, moves the release into
+`/Applications`, and relaunches a patched clone of it in place of the unpatched one, so
+"Restart to update" ends with the update applied *and* the patches on. If Conductor is
+quit instead of restarted, the release is still moved into `/Applications` on the way out.
 
 Conductor's frontend lives in its Mach-O as brotli blobs. The tool rewrites them in place,
 recompressed to fit their original slots. Seven of the eight patches are CSS rules appended
 to the stylesheet; only the `owner/repo` rewrite touches minified JS. A patch whose anchor
-has moved is reported and skipped, not fatal. `--doctor` checks the anchors, `--help` lists
-the flags. A run takes about 1.8s.
+has moved is reported and skipped, not fatal. `--doctor` checks the anchors, and with
+`--source path/to/Conductor.app` does so against a release that is not installed yet;
+`--dump DIR` writes the decoded stylesheet and scripts out for re-anchoring. `--help` lists
+the flags. A run takes about 1.8s. Everything is logged to `~/Library/Logs/conductor-qol.log`,
+which is where to look when the menu-bar mode has nothing to say.
 
 ## Build
 

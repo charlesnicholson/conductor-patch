@@ -4,8 +4,9 @@ import Foundation
 /// Where everything lives.
 enum Paths {
     /// The pristine install. Never written to, except by an adopt-back after Conductor
-    /// updates itself.
-    static let source = URL(fileURLWithPath: "/Applications/Conductor.app")
+    /// updates itself. `--source` points it elsewhere, which is how a downloaded release
+    /// gets checked with `--doctor` before it lands in /Applications.
+    nonisolated(unsafe) static var source = URL(fileURLWithPath: "/Applications/Conductor.app")
 
     static let workDirectory = FileManager.default
         .homeDirectoryForCurrentUser
@@ -192,6 +193,7 @@ enum Pipeline {
     @discardableResult
     static func patch(options: Patches.Options) throws -> [PatchOutcome] {
         let executable = Paths.executable(in: Paths.work)
+        let entitlements = captureEntitlements(of: Paths.work)
         var image = try Profile.shared.measure("read executable") { try Data(contentsOf: executable) }
         Log.debug("read \(humanBytes(image.count)) executable")
 
@@ -255,7 +257,16 @@ enum Pipeline {
         try Profile.shared.measure("write executable") {
             try image.write(to: executable, options: .atomic)
         }
-        try sign()
+        do {
+            try sign(entitlements: entitlements)
+        } catch {
+            // Put the shipped bytes back so the bundle is at least launchable as released.
+            // The original signature is embedded in the image, so restoring the image
+            // restores it.
+            Log.warn("signing failed; restoring the unpatched executable")
+            try? original.write(to: executable, options: .atomic)
+            throw error
+        }
         return outcomes
     }
 
@@ -359,7 +370,9 @@ enum Pipeline {
     // MARK: - Doctor
 
     /// Reports what the patcher can still find, without cloning, patching or signing.
-    static func doctor() throws {
+    /// With `dump`, also writes the decoded assets there, which is the raw material for
+    /// re-anchoring against a new release.
+    static func doctor(dump: URL? = nil) throws {
         let image = try Data(contentsOf: Paths.executable(in: Paths.source))
         let macho = try MachOImage(image)
 
@@ -383,6 +396,19 @@ enum Pipeline {
         describe("main script", frontend.mainScript)
         describe("sidebar host", frontend.sidebarHost)
 
+        if let dump {
+            try FileManager.default.createDirectory(at: dump, withIntermediateDirectories: true)
+            var written = Set<String>()
+            for located in [frontend.stylesheet, frontend.mainScript, frontend.sidebarHost] {
+                guard let located else { continue }
+                let name = located.entry.key.isEmpty
+                    ? located.entry.label : (located.entry.key as NSString).lastPathComponent
+                guard written.insert(name).inserted else { continue }
+                try located.content.write(to: dump.appendingPathComponent(name))
+            }
+            print("  dumped            \(written.sorted().joined(separator: ", ")) -> \(dump.path)")
+        }
+
         print("\nanchors")
         guard let corpus = frontend.mainScript?.content else {
             print("  (no application JavaScript found; nothing to check)")
@@ -401,24 +427,33 @@ enum Pipeline {
 
     // MARK: - Signing
 
+    /// The release's own entitlements, read from the work bundle before anything touches
+    /// it. At that point it is a pristine copy of whatever release it came from -- which,
+    /// when Conductor has just updated itself in place, is not the release in /Applications.
+    private static func captureEntitlements(of bundle: URL) -> URL? {
+        let file = Paths.workDirectory.appendingPathComponent("entitlements.plist")
+        try? FileManager.default.removeItem(at: file)
+        do {
+            try run("/usr/bin/codesign", ["-d", "--entitlements", file.path, "--xml", bundle.path])
+        } catch {
+            Log.warn("could not read entitlements from \(bundle.path): \(error)")
+            return nil
+        }
+        return FileManager.default.fileExists(atPath: file.path) ? file : nil
+    }
+
     /// Ad-hoc re-sign, carrying the original entitlements and hardened runtime across.
     ///
     /// Unavoidable: touching a byte of the executable invalidates Conductor's Developer ID
     /// signature, and macOS will not run an arm64 binary whose signature does not verify.
     /// Deliberately not `--deep` -- the sidecars in Resources/bin (gh, watchexec,
     /// conductor-runtime) keep their own valid signatures and are only sealed by hash.
-    private static func sign() throws {
-        let entitlements = Paths.workDirectory.appendingPathComponent("entitlements.plist")
-        try? FileManager.default.removeItem(at: entitlements)
-        try run(
-            "/usr/bin/codesign",
-            ["-d", "--entitlements", entitlements.path, "--xml", Paths.source.path])
-
+    private static func sign(entitlements: URL?) throws {
         var arguments = ["--force", "--sign", "-", "--options", "runtime"]
-        if FileManager.default.fileExists(atPath: entitlements.path) {
+        if let entitlements {
             arguments += ["--entitlements", entitlements.path]
         } else {
-            Log.warn("no entitlements recovered from \(Paths.source.path); signing without")
+            Log.warn("no entitlements recovered; signing without")
         }
         arguments.append(Paths.work.path)
 

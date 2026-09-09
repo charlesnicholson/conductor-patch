@@ -11,29 +11,71 @@ func fail(_ message: String) throws -> Never { throw PatchError(message) }
 
 // MARK: - Logging
 //
-// Progress goes to stderr so `--print-path`-style stdout stays clean, and to the status
-// item when running as an agent. `Log.observer` is how the AppKit side listens in.
+// Progress goes to stderr so `--no-launch`'s stdout path stays clean, to the status item
+// when running as an agent, and always to a log file. `Log.observer` is how the AppKit
+// side listens in.
 
 enum Log {
     nonisolated(unsafe) static var verbose = false
     nonisolated(unsafe) static var observer: ((String) -> Void)?
 
+    /// Everything, including debug lines, also lands in ~/Library/Logs/conductor-qol.log.
+    ///
+    /// In menu-bar mode stderr goes nowhere, and that is the mode the tool is normally run
+    /// in -- so when a teardown step failed there was no trace of why. The file is where
+    /// to look after the fact; it is capped by truncating when it grows past a few MB.
+    static let logFile: URL = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent("Library/Logs/conductor-qol.log")
+
+    private static let file: FileHandle? = {
+        let manager = FileManager.default
+        if let size = (try? manager.attributesOfItem(atPath: logFile.path))?[.size] as? Int,
+            size > 4 << 20
+        {
+            try? manager.removeItem(at: logFile)
+        }
+        if !manager.fileExists(atPath: logFile.path) {
+            try? manager.createDirectory(
+                at: logFile.deletingLastPathComponent(), withIntermediateDirectories: true)
+            manager.createFile(atPath: logFile.path, contents: nil)
+        }
+        guard let handle = FileHandle(forWritingAtPath: logFile.path) else { return nil }
+        handle.seekToEndOfFile()
+        let arguments = CommandLine.arguments.dropFirst().joined(separator: " ")
+        handle.write(Data("\n--- conductor-qol pid \(getpid()) [\(arguments)]\n".utf8))
+        return handle
+    }()
+
+    private static let clock: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy-MM-dd HH:mm:ss.SSS"
+        return formatter
+    }()
+
+    private static let lock = NSLock()
+
+    private static func emit(_ line: String, toStderr: Bool) {
+        lock.lock()
+        defer { lock.unlock() }
+        if toStderr { FileHandle.standardError.write(Data((line + "\n").utf8)) }
+        file?.write(Data("\(clock.string(from: Date())) \(line)\n".utf8))
+    }
+
     static func step(_ message: String) {
-        FileHandle.standardError.write(Data("==> \(message)\n".utf8))
+        emit("==> \(message)", toStderr: true)
         observer?(message)
     }
 
     static func info(_ message: String) {
-        FileHandle.standardError.write(Data("    \(message)\n".utf8))
+        emit("    \(message)", toStderr: true)
     }
 
     static func debug(_ message: String) {
-        guard verbose else { return }
-        FileHandle.standardError.write(Data("    [debug] \(message)\n".utf8))
+        emit("    [debug] \(message)", toStderr: verbose)
     }
 
     static func warn(_ message: String) {
-        FileHandle.standardError.write(Data("warning: \(message)\n".utf8))
+        emit("warning: \(message)", toStderr: true)
     }
 }
 
