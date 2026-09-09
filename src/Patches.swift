@@ -21,7 +21,6 @@ enum Patches {
     struct Options {
         var widenTranscript = true
         var widenBubbles = true
-        var brightenRepoLabels = true
         var bandRepoGroups = true
         var qualifyRepoNames = true
     }
@@ -121,8 +120,10 @@ enum Patches {
             evidence: ["max-w-xl", "lg:max-w-3xl"], literals: []),
     ]
 
-    static let sidebarRules: [StyleRule] = [
-        // Alternating bands, one per repository group.
+    static let bandingRules: [StyleRule] = [
+        // Alternating bands, one per repository group. Groups delineate by region rather
+        // than by making any text heavier or brighter, which is what made the panel busy
+        // when the header itself was restyled -- the header keeps Conductor's own colour.
         //
         // No JavaScript required, because the DOM already has exactly the right shape: the
         // repo list is a @hello-pangea/dnd droppable whose id is "repo-list", each group is
@@ -148,31 +149,10 @@ enum Patches {
                 + ";border-radius:6px",
             evidence: [],
             literals: ["repo-list", "data-rfd-draggable-id"]),
-
-        // The repository group header, lifted out of the muted palette.
-        //
-        // It ships as `--sidebar-muted-foreground`, which is white at 60% in the dark
-        // theme -- dimmer than the session rows beneath it, which inherit the full
-        // `--sidebar-foreground`. Promoting the header to that same token is a 30-point
-        // jump in alpha and reads as a heading without adding weight, which at 700 just
-        // made the panel busy.
-        //
-        // Using the token rather than a literal colour keeps it correct in the light
-        // theme too, where the same pair is #14100f at 60% and 70%.
-        //
-        // `font-sans` is the discriminator: the header is the only sidebar element pairing
-        // it with `font-medium`, so three classes identify it uniquely without pinning the
-        // layout utilities that are likelier to churn.
-        StyleRule(
-            name: "repo label colour",
-            selector: ".font-sans.font-medium.text-sidebar-muted-foreground",
-            declarations: "color:var(--sidebar-foreground)",
-            evidence: ["font-sans", "font-medium", "text-sidebar-muted-foreground"],
-            literals: []),
     ]
 
     /// Every style rule, for reporting.
-    static var allStyleRules: [StyleRule] { transcriptRules + bubbleRules + sidebarRules }
+    static var allStyleRules: [StyleRule] { transcriptRules + bubbleRules + bandingRules }
 
     // MARK: - Stylesheet patch
 
@@ -194,16 +174,8 @@ enum Patches {
             outcomes.append(
                 PatchOutcome(name: "message bubbles", status: .disabled, detail: "--no-widen-bubbles"))
         }
-        if options.brightenRepoLabels {
-            rules += sidebarRules.filter { $0.name != "repo group banding" }
-        } else {
-            outcomes.append(
-                PatchOutcome(
-                    name: "repo label colour", status: .disabled,
-                    detail: "--no-brighten-repos"))
-        }
         if options.bandRepoGroups {
-            rules += sidebarRules.filter { $0.name == "repo group banding" }
+            rules += bandingRules
         } else {
             outcomes.append(
                 PatchOutcome(

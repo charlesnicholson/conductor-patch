@@ -28,10 +28,10 @@ struct Options {
           --keep                 do not delete the clone on exit
           --no-widen-transcript  leave the chat column capped at max-w-4xl
           --no-widen-bubbles     leave your own message bubbles capped at lg:max-w-3xl
-          --no-brighten-repos    leave sidebar repository labels in the muted palette
           --no-band-repos        do not alternate background tints per repository group
           --no-repo-names        leave sidebar groups showing the bare repository name
-          --cli / --gui          force terminal or menu-bar mode (default: by isatty)
+          --cli / --gui          force terminal or menu-bar mode (default: by isatty;
+                                 --doctor and --no-launch are always terminal)
           -v, --verbose          more detail
           -h, --help             this text
         """
@@ -45,7 +45,6 @@ struct Options {
             case "--keep": options.keepBundle = true
             case "--no-widen-transcript": options.patches.widenTranscript = false
             case "--no-widen-bubbles": options.patches.widenBubbles = false
-            case "--no-brighten-repos": options.patches.brightenRepoLabels = false
             case "--no-band-repos": options.patches.bandRepoGroups = false
             case "--no-repo-names": options.patches.qualifyRepoNames = false
             case "--cli": options.forceCLI = true
@@ -203,8 +202,15 @@ if options.doctor {
 }
 
 let runner = Runner(options)
-let interactive =
-    options.forceCLI || (!options.forceGUI && isatty(FileHandle.standardError.fileDescriptor) == 1)
+
+// Menu-bar mode exists to give a long-lived launch a Quit affordance and somewhere to put
+// log lines. A --no-launch run needs neither: it starts nothing and returns as soon as it
+// has printed the clone's path. Leaving it on the isatty default meant invoking the tool
+// from any non-terminal parent -- a script, an agent's shell -- put a modal dialog on
+// screen instead of text on the pipe the caller was reading. An explicit --gui still wins.
+// (--doctor never reaches here; it runs and exits above.)
+let wantsMenuBar = options.launch && isatty(FileHandle.standardError.fileDescriptor) != 1
+let interactive = options.forceCLI || !(options.forceGUI || wantsMenuBar)
 
 if interactive {
     let sources = installSignalHandlers {
