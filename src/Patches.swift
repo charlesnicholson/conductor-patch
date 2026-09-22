@@ -21,7 +21,6 @@ enum Patches {
     struct Options {
         var widenTranscript = true
         var widenBubbles = true
-        var bandRepoGroups = true
         var qualifyRepoNames = true
     }
 
@@ -120,39 +119,8 @@ enum Patches {
             evidence: ["max-w-xl", "lg:max-w-3xl"], literals: []),
     ]
 
-    static let bandingRules: [StyleRule] = [
-        // Alternating bands, one per repository group. Groups delineate by region rather
-        // than by making any text heavier or brighter, which is what made the panel busy
-        // when the header itself was restyled -- the header keeps Conductor's own colour.
-        //
-        // No JavaScript required, because the DOM already has exactly the right shape: the
-        // repo list is a @hello-pangea/dnd droppable whose id is "repo-list", each group is
-        // one draggable child of it, and each of those wraps the header *and* its sessions.
-        // So tinting every other child gives banded groups for free, and a group's sessions
-        // inherit their header's band rather than needing to be matched separately. When
-        // every repo is collapsed each group is one row, so it degrades to alternating rows.
-        //
-        // Keyed on the library's data attributes rather than utility classes: `repo-list`
-        // is a semantic identifier the Conductor authors chose, and churns far less than
-        // Tailwind soup.
-        //
-        // color-mix against --sidebar-foreground rather than a literal rgba keeps the tint
-        // the right polarity in both themes: that token is white at 90% in the dark theme
-        // and near-black at 70% in the light one, so the band lifts in one and darkens in
-        // the other. 5% of it lands just under the 5% flat white of --sidebar-accent, which
-        // is the row hover colour, so hover still reads on a banded group.
-        StyleRule(
-            name: "repo group banding",
-            selector: "[data-rfd-droppable-id='repo-list']>[data-rfd-draggable-id]:nth-child(even)",
-            declarations:
-                "background:color-mix(in srgb,var(--sidebar-foreground) 5%,transparent)"
-                + ";border-radius:6px",
-            evidence: [],
-            literals: ["repo-list", "data-rfd-draggable-id"]),
-    ]
-
     /// Every style rule, for reporting.
-    static var allStyleRules: [StyleRule] { transcriptRules + bubbleRules + bandingRules }
+    static var allStyleRules: [StyleRule] { transcriptRules + bubbleRules }
 
     // MARK: - Stylesheet patch
 
@@ -173,13 +141,6 @@ enum Patches {
         } else {
             outcomes.append(
                 PatchOutcome(name: "message bubbles", status: .disabled, detail: "--no-widen-bubbles"))
-        }
-        if options.bandRepoGroups {
-            rules += bandingRules
-        } else {
-            outcomes.append(
-                PatchOutcome(
-                    name: "repo group banding", status: .disabled, detail: "--no-band-repos"))
         }
         guard !rules.isEmpty else { return outcomes }
 
