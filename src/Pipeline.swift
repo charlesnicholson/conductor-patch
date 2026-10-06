@@ -419,7 +419,7 @@ enum Pipeline {
             print("  \(ok ? "ok     " : "MISSING")  \(rule.name): \(rule.selector)")
         }
         if let host = frontend.sidebarHost?.content, let header = Patches.findHeader(in: host) {
-            print("  ok       repository names: \(header.repoVariable).name")
+            print("  ok       repository names: \(header.original)")
         } else {
             print("  MISSING  repository names: sidebar header assignment not found")
         }
