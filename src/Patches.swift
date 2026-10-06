@@ -213,33 +213,37 @@ enum Patches {
     ///
     /// The header component destructures its props and takes the bare name:
     ///
-    ///     {repository:n,workspaceIds:i,pendingWorkspaceIds:r, ... }=t, ... ,b=n.name;
+    ///     {repository:n,localWorkspaceIds:i,pendingWorkspaceIds:r, ... }=t, ... ,g=n.displayName;
     ///
-    /// Only `n.name` is replaced, not the whole assignment, so nothing depends on what the
-    /// destination variable is called or whether the statement ends in `,` or `;`. The
-    /// props parameter is matched as any identifier rather than the literal `t`: that name
-    /// is minifier output and will eventually change.
+    /// Before 0.90 that read `n.name`. 0.90 added a derived `displayName`, which is the
+    /// remote's last path segment in a cloud org and the plain name otherwise -- the bare
+    /// repository name either way -- so both spellings are accepted.
+    ///
+    /// Only `n.displayName` is replaced, not the whole assignment, so nothing depends on
+    /// what the destination variable is called or whether the statement ends in `,` or `;`.
+    /// The props parameter is matched as any identifier rather than the literal `t`: that
+    /// name is minifier output and will eventually change.
     private static let headerPattern = """
         \\{repository:([A-Za-z_$][A-Za-z0-9_$]*),[^}]{0,200}pendingWorkspaceIds:[^}]{0,200}\\}\
-        =[A-Za-z_$][A-Za-z0-9_$]*,[\\s\\S]{0,400}?=(\\1\\.name)\\b
+        =[A-Za-z_$][A-Za-z0-9_$]*,[\\s\\S]{0,400}?=(\\1\\.(?:displayName|name))\\b
         """
 
-    /// Derives `owner/repo` from a git remote, falling back to the plain name for anything
-    /// that is not `host.tld[:/]owner/repo` -- notably the `file://` remotes Conductor
-    /// writes for a locally-added project, which would otherwise render as a meaningless
-    /// trailing path pair.
-    private static func nameExpression(repoVariable: String) -> String {
+    /// Derives `owner/repo` from a git remote, falling back to whatever the header showed
+    /// before for anything that is not `host.tld[:/]owner/repo` -- notably the `file://`
+    /// remotes Conductor writes for a locally-added project, which would otherwise render
+    /// as a meaningless trailing path pair.
+    private static func nameExpression(repoVariable: String, original: String) -> String {
         let body = #"""
-            (function(_r){\#
+            (function(_r,_f){\#
             var _u=_r.remoteUrl;\#
-            if(typeof _u!=="string")return _r.name;\#
+            if(typeof _u!=="string")return _f;\#
             var _m=/^(?:[a-z][a-z0-9+.-]*:\/\/)?(?:[^@\/]+@)?([^\/:]+\.[^\/:]+)[:\/](.+?)(?:\.git)?\/?$/i.exec(_u);\#
-            if(!_m)return _r.name;\#
+            if(!_m)return _f;\#
             var _s=_m[2].split("/").filter(Boolean);\#
-            return _s.length>=2?_s.slice(-2).join("/"):_r.name;\#
+            return _s.length>=2?_s.slice(-2).join("/"):_f;\#
             })
             """#
-        return marker + body + "(" + repoVariable + ")"
+        return marker + body + "(" + repoVariable + "," + original + ")"
     }
 
     static func qualifyRepoNames(in script: inout Data, options: Options) -> PatchOutcome {
@@ -255,13 +259,16 @@ enum Patches {
         }
 
         script.replaceSubrange(
-            match.range, with: Data(nameExpression(repoVariable: match.repoVariable).utf8))
-        return PatchOutcome(
-            name: name, status: .applied, detail: "rewrote \(match.repoVariable).name")
+            match.range,
+            with: Data(
+                nameExpression(repoVariable: match.repoVariable, original: match.original).utf8))
+        return PatchOutcome(name: name, status: .applied, detail: "rewrote \(match.original)")
     }
 
     /// Located without mutating, so `--doctor` can report on it.
-    static func findHeader(in script: Data) -> (range: Range<Int>, repoVariable: String)? {
+    static func findHeader(in script: Data)
+        -> (range: Range<Int>, repoVariable: String, original: String)?
+    {
         guard let regex = try? NSRegularExpression(pattern: headerPattern) else { return nil }
 
         for anchorOffset in script.occurrences(of: Data(headerAnchor.utf8)) {
@@ -278,13 +285,14 @@ enum Patches {
             let text = String(decoding: window, as: UTF8.self)
             let full = NSRange(text.startIndex ..< text.endIndex, in: text)
             guard let match = regex.firstMatch(in: text, range: full),
-                let repoVariable = Range(match.range(at: 1), in: text).map({ String(text[$0]) })
+                let repoVariable = Range(match.range(at: 1), in: text).map({ String(text[$0]) }),
+                let original = Range(match.range(at: 2), in: text).map({ String(text[$0]) })
             else { continue }
 
             let target = match.range(at: 2)
             return (
                 (start + target.location) ..< (start + target.location + target.length),
-                repoVariable
+                repoVariable, original
             )
         }
         return nil
