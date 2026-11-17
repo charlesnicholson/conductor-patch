@@ -17,18 +17,30 @@ clone and relaunches from it; the tool notices the version change, moves the rel
 "Restart to update" ends with the update applied *and* the patches on. If Conductor is
 quit instead of restarted, the release is still moved into `/Applications` on the way out.
 
-Conductor's frontend lives in its Mach-O as brotli blobs. The tool rewrites them in place,
-recompressed to fit their original slots. Six of the seven patches are CSS rules appended
-to the stylesheet; only the `owner/repo` rewrite touches minified JS. A patch whose anchor
-has moved is reported and skipped, not fatal. `--doctor` checks the anchors, and with
-`--source path/to/Conductor.app` does so against a release that is not installed yet;
-`--dump DIR` writes the decoded stylesheet and scripts out for re-anchoring. `--help` lists
-the flags. A run takes about 1.8s. Everything is logged to `~/Library/Logs/conductor-qol.log`,
-which is where to look when the menu-bar mode has nothing to say.
+Conductor is an Electron app, and its whole frontend ships in `Contents/Resources/app.asar`.
+The tool rewrites two files inside it: the Tailwind stylesheet and the main script chunk.
+Six of the seven patches are CSS rules appended to the stylesheet. Only the `owner/repo`
+rewrite touches minified JS. The rewritten files are appended to the archive, and their
+header entries are repointed with fresh integrity hashes. Every other file keeps its bytes
+and offsets. Conductor enforces asar integrity, so the new header hash also goes into
+`Info.plist`, and the archive is read back and checked before anything is signed. The clone
+is re-signed ad-hoc with Conductor's own entitlements plus `disable-library-validation`.
+Without that entitlement, an ad-hoc main executable may not load the Electron Framework,
+which is still signed by Conductor's team.
+
+A patch whose anchor has moved is reported and skipped, not fatal. `--doctor` checks the
+anchors, and with `--source path/to/Conductor.app` does so against a release that is not
+installed yet. `--dump DIR` writes the stylesheet and script out for re-anchoring. `--help`
+lists the flags. A run takes about 1.5s. Everything is logged to
+`~/Library/Logs/conductor-qol.log`, which is where to look when the menu-bar mode has
+nothing to say.
+
+Conductor 0.95 and later only. The Tauri builds before it kept the frontend as brotli blobs
+inside the executable, and the code that patched those is in git history up to `f406de8`.
 
 ## Build
 
-Needs Xcode; envy fetches brotli and cmake into a project-local `.envy` on first build.
+Needs Xcode, nothing else.
 
 ```sh
 ./build.sh              # build into out/

@@ -16,7 +16,7 @@ struct Options {
     static let usage = """
         conductor-qol - launch Conductor with quality-of-life patches applied.
 
-        Clones /Applications/Conductor.app, rewrites the cloned copy's embedded frontend,
+        Clones /Applications/Conductor.app, rewrites the frontend in the clone's app.asar,
         re-signs it ad-hoc, launches it, and deletes the clone when it exits. The installed
         copy is never modified, so Conductor's own auto-update keeps working: when the
         running clone updates itself, the new release is moved into /Applications and a
@@ -25,7 +25,7 @@ struct Options {
         usage: conductor-qol [options]
 
           --doctor               report which anchors still match, patch nothing, exit
-          --dump DIR             with --doctor: write the decoded stylesheet and scripts to DIR
+          --dump DIR             with --doctor: write the stylesheet and scripts it found to DIR
           --source PATH          the Conductor.app to clone or inspect (default: /Applications)
           --no-launch            patch only; leave the clone in place and print its path
           --keep                 do not delete the clone on exit

@@ -16,35 +16,48 @@ enum Paths {
     /// bundle-relative logic sees nothing unusual.
     static let work = workDirectory.appendingPathComponent("Conductor.app", isDirectory: true)
 
+    /// Whatever CFBundleExecutable names: `Conductor` for the Electron builds, `conductor`
+    /// for the Tauri builds before them. Read rather than assumed, because Conductor's
+    /// updater can install either over the other.
     static func executable(in bundle: URL) -> URL {
-        bundle.appendingPathComponent("Contents/MacOS/conductor")
+        let name = (try? infoDictionary(of: bundle))?["CFBundleExecutable"] as? String
+        return bundle.appendingPathComponent("Contents/MacOS/\(name ?? "Conductor")")
     }
 
     static func infoPlist(in bundle: URL) -> URL {
         bundle.appendingPathComponent("Contents/Info.plist")
     }
+
+    static func asar(in bundle: URL) -> URL {
+        bundle.appendingPathComponent("Contents/Resources/app.asar")
+    }
+
+    static func infoDictionary(of bundle: URL) throws -> [String: Any] {
+        let data = try Data(contentsOf: infoPlist(in: bundle))
+        guard
+            let plist = try PropertyListSerialization.propertyList(from: data, format: nil)
+                as? [String: Any]
+        else {
+            throw PatchError("\(bundle.lastPathComponent): Info.plist is not a dictionary")
+        }
+        return plist
+    }
 }
 
-/// The three assets the patches need, each located independently.
-///
-/// Resolved once at construction rather than as computed properties: each lookup scans
-/// decoded blobs, and `frontend.stylesheet?.content` plus `frontend.stylesheet?.entry` is
-/// two evaluations of the same search.
+/// The three files the patches need, each located independently.
 struct Frontend {
-    let entries: [AssetEntry]
-    let usedFallback: Bool
-    let decodedCount: Int
+    typealias Located = (file: AsarArchive.File, content: Data)
 
-    /// Where the width rules are appended.
-    let stylesheet: (entry: AssetEntry, content: Data)?
+    let archive: AsarArchive
+
+    /// Where the width rules are appended: the Tailwind stylesheet.
+    let stylesheet: Located?
     /// The biggest chunk of application JavaScript; only the corpus for checking that the
     /// CSS rules still have something to match.
-    let mainScript: (entry: AssetEntry, content: Data)?
-    /// Whichever asset still contains the sidebar header assignment -- searched for rather
+    let mainScript: Located?
+    /// Whichever chunk still contains the sidebar header assignment -- searched for rather
     /// than assumed to be the main chunk, since Vite is free to split it out.
-    let sidebarHost: (entry: AssetEntry, content: Data)?
-
-    var isUsable: Bool { mainScript != nil }
+    let sidebarHost: Located?
 }
 
 enum Pipeline {
@@ -69,7 +82,7 @@ enum Pipeline {
         }
 
         // Never yank a bundle out from under a live process: the executable is mapped, but
-        // the sidecars in Resources/bin are re-exec'd on demand and would vanish.
+        // the helpers and the native server are exec'd from it on demand and would vanish.
         let running = Launcher.processes(under: Paths.work)
         guard running.isEmpty else {
             throw PatchError(
@@ -81,7 +94,7 @@ enum Pipeline {
     }
 
     /// APFS clone of the source bundle. Both paths are on the Data volume, so this is a
-    /// copy-on-write clone rather than a 196 MB copy.
+    /// copy-on-write clone rather than a 400 MB copy.
     static func cloneBundle() throws {
         try FileManager.default.createDirectory(
             at: Paths.workDirectory, withIntermediateDirectories: true)
@@ -97,11 +110,8 @@ enum Pipeline {
     }
 
     static func bundleVersion(of bundle: URL) throws -> String {
-        let data = try Data(contentsOf: Paths.infoPlist(in: bundle))
-        guard
-            let plist = try PropertyListSerialization.propertyList(
-                from: data, format: nil) as? [String: Any],
-            let version = plist["CFBundleShortVersionString"] as? String
+        guard let version = try Paths.infoDictionary(of: bundle)["CFBundleShortVersionString"]
+            as? String
         else {
             throw PatchError("\(bundle.lastPathComponent): no CFBundleShortVersionString")
         }
@@ -110,136 +120,107 @@ enum Pipeline {
 
     // MARK: - Discovery
 
-    /// Finds the assets the patches need, decoding as few as possible.
-    ///
-    /// Assets are visited stylesheet-first then largest-first, because the two targets are
-    /// the one `.css` and the biggest `.js`, and the search stops as soon as all three are
-    /// in hand. In practice that is two blobs decoded instead of two thousand nine hundred.
-    static func locate(in image: Data, macho: MachOImage) throws -> Frontend {
-        let table = try AssetTable(macho)
-        Log.debug(
-            "pointers: \(macho.hasChainedFixups ? "chained fixups" : "classic rebases"), "
-                + "image base 0x\(String(macho.imageBase, radix: 16))")
-
-        let entries = Profile.shared.measure("scan asset table") { table.entries(in: image) }
-        Log.info("asset table: \(entries.count) keyed entries")
-
-        var frontend = Profile.shared.measure("decode assets") {
-            resolve(entries, in: image, usedFallback: false)
+    static func openArchive(in bundle: URL) throws -> AsarArchive {
+        let url = Paths.asar(in: bundle)
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            throw PatchError(
+                "\(bundle.path) has no Contents/Resources/app.asar. This tool patches the "
+                    + "Electron builds of Conductor (0.95 and later); this does not look like one.")
         }
-        if !frontend.isUsable || frontend.stylesheet == nil {
-            Log.warn("keyed asset scan came up short; falling back to a raw slice scan")
-            let slices = table.slices(in: image)
-            Log.info("raw slice scan: \(slices.count) candidates")
-            frontend = Profile.shared.measure("decode assets (fallback)") {
-                resolve(slices, in: image, usedFallback: true)
-            }
-        }
-        Log.debug("decoded \(frontend.decodedCount) asset(s) to locate targets")
-        return frontend
+        return try Profile.shared.measure("read app.asar") { try AsarArchive(contentsOf: url) }
     }
 
-    private static func resolve(_ entries: [AssetEntry], in image: Data, usedFallback: Bool)
-        -> Frontend
-    {
-        let ordered = entries.sorted { left, right in
-            let leftCSS = left.key.hasSuffix(".css"), rightCSS = right.key.hasSuffix(".css")
-            if leftCSS != rightCSS { return leftCSS }
-            return left.dataLength > right.dataLength
-        }
-
-        func contains(_ content: Data, anyOf needles: [String]) -> Bool {
-            needles.contains { content.range(of: Data($0.utf8)) != nil }
-        }
-
-        var stylesheet: (entry: AssetEntry, content: Data)?
-        var mainScript: (entry: AssetEntry, content: Data)?
-        var sidebarHost: (entry: AssetEntry, content: Data)?
-        var decodedCount = 0
-
-        for entry in ordered {
-            if stylesheet != nil, mainScript != nil, sidebarHost != nil { break }
-            guard let content = try? Brotli.decompress(image[entry.dataRange]) else { continue }
-            decodedCount += 1
-
-            if stylesheet == nil,
-                entry.key.hasSuffix(".css") || contains(content, anyOf: Patches.stylesheetAnchors)
-            {
-                stylesheet = (entry, content)
+    /// Finds the files the patches need among the frontend's ~3000, reading as few as
+    /// possible: one stylesheet, the largest script, and -- usually that same script --
+    /// whichever chunk holds the sidebar header.
+    static func locate(in archive: AsarArchive) -> Frontend {
+        Profile.shared.measure("locate assets") {
+            let frontend = archive.files.filter { $0.path.hasPrefix("frontend/") }
+            func bySize(_ suffix: String) -> [AsarArchive.File] {
+                frontend.filter { $0.path.hasSuffix(suffix) }.sorted { $0.size > $1.size }
             }
-            // Size-descending order means the first JavaScript seen is the biggest.
-            if mainScript == nil,
-                entry.key.hasSuffix(".js") || contains(content, anyOf: Patches.scriptAnchors)
-            {
-                mainScript = (entry, content)
+            func raw(_ file: AsarArchive.File) -> Data {
+                let start = archive.dataStart + file.offset
+                return archive.bytes[start ..< start + file.size]
             }
-            if sidebarHost == nil, Patches.findHeader(in: content) != nil {
-                sidebarHost = (entry, content)
-            }
-        }
 
-        return Frontend(
-            entries: entries, usedFallback: usedFallback, decodedCount: decodedCount,
-            stylesheet: stylesheet, mainScript: mainScript, sidebarHost: sidebarHost)
+            let stylesheets = bySize(".css")
+            let stylesheet = (stylesheets.first {
+                raw($0).range(of: Data(Patches.stylesheetAnchor.utf8)) != nil
+            } ?? stylesheets.first).map { ($0, archive.contents(of: $0)) }
+
+            let scripts = bySize(".js")
+            let mainScript = scripts.first.map { ($0, archive.contents(of: $0)) }
+
+            var sidebarHost: Frontend.Located?
+            let anchor = Data(Patches.headerAnchor.utf8)
+            for file in scripts where raw(file).range(of: anchor) != nil {
+                let content = file.path == mainScript?.0.path
+                    ? mainScript!.1 : archive.contents(of: file)
+                if Patches.findHeader(in: content) != nil {
+                    sidebarHost = (file, content)
+                    break
+                }
+            }
+
+            return Frontend(
+                archive: archive, stylesheet: stylesheet, mainScript: mainScript,
+                sidebarHost: sidebarHost)
+        }
     }
 
     // MARK: - Patching
 
-    /// Rewrites the cloned executable in place, then re-signs the bundle.
+    /// Rewrites the cloned bundle's app.asar, points Info.plist at the new header, and
+    /// re-signs the bundle.
     ///
-    /// Returns what did and did not apply. Only a structural failure -- no assets at all,
-    /// a blob that will not fit, a broken integrity sweep -- throws; a patch whose anchor
-    /// has moved is reported and skipped so the rest still land.
+    /// Returns what did and did not apply. Only a structural failure -- no frontend at
+    /// all, a broken integrity check, a failed signature -- throws; a patch whose anchor
+    /// has moved is reported and skipped so the rest still land. When it throws, the clone
+    /// is left as shipped.
     @discardableResult
     static func patch(options: Patches.Options) throws -> [PatchOutcome] {
-        let executable = Paths.executable(in: Paths.work)
-        let entitlements = captureEntitlements(of: Paths.work)
-        var image = try Profile.shared.measure("read executable") { try Data(contentsOf: executable) }
-        Log.debug("read \(humanBytes(image.count)) executable")
-
-        let macho = try Profile.shared.measure("parse Mach-O") { try MachOImage(image) }
-        let frontend = try locate(in: image, macho: macho)
+        let archive = try openArchive(in: Paths.work)
+        Log.debug("app.asar: \(archive.files.count) files, \(humanBytes(archive.bytes.count))")
+        let frontend = locate(in: archive)
 
         guard let corpus = frontend.mainScript?.content else {
-            throw PatchError("could not find any application JavaScript in the asset table")
+            throw PatchError("could not find any application JavaScript in app.asar")
         }
         let targets = [frontend.stylesheet, frontend.mainScript, frontend.sidebarHost]
         guard !targets.contains(where: { $0.map { Patches.alreadyPatched($0.content) } ?? false })
         else {
-            throw PatchError("this image is already patched; refusing to patch it twice")
+            throw PatchError("this app.asar is already patched; refusing to patch it twice")
         }
 
-        // Copy-on-write snapshot, so this costs nothing until the first mutation below.
-        let original = image
-
         var outcomes: [PatchOutcome] = []
-        var pending: [(entry: AssetEntry, content: Data)] = []
+        var replacements: [String: Data] = [:]
 
         // Widths, via rules appended to the stylesheet.
-        if var stylesheet = frontend.stylesheet?.content, let entry = frontend.stylesheet?.entry {
+        if var stylesheet = frontend.stylesheet?.content, let file = frontend.stylesheet?.file {
             let widthOutcomes = Patches.injectStyles(
                 stylesheet: &stylesheet, script: corpus, options: options)
             outcomes += widthOutcomes
             if widthOutcomes.contains(where: { $0.status != .disabled }) {
-                pending.append((entry, stylesheet))
+                replacements[file.path] = stylesheet
             }
         } else {
             outcomes.append(
                 PatchOutcome(
-                    name: "chat column", status: .missing, detail: "no stylesheet asset found"))
+                    name: "chat column", status: .missing, detail: "no stylesheet found"))
         }
 
         // Sidebar repository names, in whichever chunk still carries the header.
         if options.qualifyRepoNames {
-            if var host = frontend.sidebarHost?.content, let entry = frontend.sidebarHost?.entry {
+            if var host = frontend.sidebarHost?.content, let file = frontend.sidebarHost?.file {
                 let outcome = Patches.qualifyRepoNames(in: &host, options: options)
                 outcomes.append(outcome)
-                if outcome.status == .applied { pending.append((entry, host)) }
+                if outcome.status == .applied { replacements[file.path] = host }
             } else {
                 outcomes.append(
                     PatchOutcome(
                         name: "repository names", status: .missing,
-                        detail: "no asset contains the sidebar header assignment"))
+                        detail: "no script contains the sidebar header assignment"))
             }
         } else {
             outcomes.append(
@@ -247,150 +228,162 @@ enum Pipeline {
                     name: "repository names", status: .disabled, detail: "--no-repo-names"))
         }
 
-        let written = try compressAll(pending)
-        for (entry, blob) in written { try image.writeAsset(blob, to: entry) }
-
-        try Profile.shared.measure("integrity check") {
-            try verify(original: original, patched: image, written: written)
+        guard !replacements.isEmpty else {
+            // Nothing to write, so nothing to re-sign: launch the release exactly as shipped,
+            // Developer ID signature and all.
+            Log.info("nothing to patch; leaving the clone as shipped")
+            return outcomes
         }
 
-        try Profile.shared.measure("write executable") {
-            try image.write(to: executable, options: .atomic)
-        }
-        do {
-            try sign(entitlements: entitlements)
-        } catch {
-            // Put the shipped bytes back so the bundle is at least launchable as released.
-            // The original signature is embedded in the image, so restoring the image
-            // restores it.
-            Log.warn("signing failed; restoring the unpatched executable")
-            try? original.write(to: executable, options: .atomic)
-            throw error
-        }
+        try install(replacements, from: archive)
         return outcomes
     }
 
-    /// Proves the patch touched nothing it did not mean to.
+    /// Writes the patched archive beside the clone, checks it, then swaps it in along with
+    /// the new Info.plist hash and signature.
     ///
-    /// Stronger than re-decoding every asset and about twenty times cheaper: rather than
-    /// checking that the other 2900 blobs still happen to decode, this checks that their
-    /// bytes are untouched, by memcmp-ing the gaps between the ranges we deliberately
-    /// wrote. Then it decodes the blobs we did write, out of the final image, and confirms
-    /// they reproduce exactly the content intended.
+    /// Everything that could fail on a bad archive happens before the bundle is touched.
+    /// From the swap onwards the shipped files are kept in a rollback directory, so a
+    /// failed signature puts the clone back as it was -- which matters after an update
+    /// that could not be adopted, when the clone is the only copy of the new release.
+    private static func install(_ replacements: [String: Data], from archive: AsarArchive) throws {
+        let entitlements = prepareEntitlements(of: Paths.work)
+
+        let staged = Paths.workDirectory.appendingPathComponent("app.asar.staged")
+        try? FileManager.default.removeItem(at: staged)
+        defer { try? FileManager.default.removeItem(at: staged) }
+
+        let headerHash = try Profile.shared.measure("write app.asar") {
+            try archive.write(to: staged, replacing: replacements)
+        }
+        for (path, content) in replacements.sorted(by: { $0.key < $1.key }) {
+            let original = archive.files.first { $0.path == path }?.size ?? 0
+            Log.info(
+                "\((path as NSString).lastPathComponent): \(humanBytes(original)) -> "
+                    + humanBytes(content.count))
+        }
+        try Profile.shared.measure("integrity check") {
+            try verify(original: archive, patched: staged, replacements: replacements, headerHash: headerHash)
+        }
+
+        let rollback = try Rollback(
+            saving: [
+                Paths.asar(in: Paths.work), Paths.infoPlist(in: Paths.work),
+                Paths.executable(in: Paths.work),
+                Paths.work.appendingPathComponent("Contents/_CodeSignature/CodeResources"),
+            ])
+        do {
+            guard rename(staged.path, Paths.asar(in: Paths.work).path) == 0 else {
+                throw PatchError("could not move the patched app.asar into place: "
+                    + String(cString: strerror(errno)))
+            }
+            try setAsarHeaderHash(headerHash, in: Paths.work)
+            try sign(entitlements: entitlements)
+            rollback.discard()
+        } catch {
+            Log.warn("could not finish patching; restoring the clone as shipped")
+            rollback.restore()
+            throw error
+        }
+    }
+
+    /// Proves the rewrite touched nothing it did not mean to, by reading the staged archive
+    /// back as Electron will.
+    ///
+    /// The data region is compared byte for byte against the original's, every entry not
+    /// being replaced must come back with the same offset, size and integrity, and every
+    /// replacement must read back as exactly the content intended and match its own
+    /// integrity hash. Cheap: it is a memcmp and a dictionary walk, not 3000 re-hashes.
     private static func verify(
-        original: Data, patched: Data, written: [(entry: AssetEntry, blob: Data)]
+        original: AsarArchive, patched url: URL, replacements: [String: Data], headerHash: String
     ) throws {
-        guard original.count == patched.count else {
-            throw PatchError("patched image changed size: \(original.count) -> \(patched.count)")
+        let patched = try AsarArchive(contentsOf: url)
+        guard patched.headerHash == headerHash else {
+            throw PatchError("integrity check failed: header hash changed after writing")
         }
 
-        var allowed: [Range<Int>] = []
-        for (entry, _) in written {
-            allowed.append(entry.dataOffset ..< entry.dataOffset + entry.dataLength)
-            allowed.append(entry.lengthFieldOffset ..< entry.lengthFieldOffset + 8)
+        let originalData = original.bytes[original.dataStart...]
+        let carried = patched.bytes[patched.dataStart ..< patched.dataStart + originalData.count]
+        guard originalData == carried else {
+            throw PatchError("integrity check failed: the existing file data did not survive")
         }
-        allowed.sort { $0.lowerBound < $1.lowerBound }
 
-        var gaps: [Range<Int>] = []
-        var cursor = 0
-        for range in allowed {
-            if range.lowerBound > cursor { gaps.append(cursor ..< range.lowerBound) }
-            cursor = max(cursor, range.upperBound)
+        let before = Dictionary(uniqueKeysWithValues: original.files.map { ($0.path, $0) })
+        let after = Dictionary(uniqueKeysWithValues: patched.files.map { ($0.path, $0) })
+        guard Set(before.keys) == Set(after.keys) else {
+            throw PatchError("integrity check failed: the set of files changed")
         }
-        if cursor < original.count { gaps.append(cursor ..< original.count) }
 
-        let identical = original.withUnsafeBytes { left in
-            patched.withUnsafeBytes { right -> Bool in
-                for gap in gaps
-                where memcmp(
-                    left.baseAddress! + gap.lowerBound, right.baseAddress! + gap.lowerBound,
-                    gap.count) != 0 {
-                    return false
+        for (path, old) in before {
+            let new = after[path]!
+            if let content = replacements[path] {
+                guard patched.contents(of: new) == content else {
+                    throw PatchError("\(path): stored contents do not match what was written")
                 }
-                return true
+                let expected = AsarArchive.integrity(
+                    of: content,
+                    blockSize: (patched.integrity(of: path)?["blockSize"] as? Int)
+                        ?? AsarArchive.defaultBlockSize)
+                guard patched.integrity(of: path) == expected else {
+                    throw PatchError("\(path): integrity does not match the stored contents")
+                }
+            } else {
+                guard old.offset == new.offset, old.size == new.size,
+                    original.integrity(of: path) == patched.integrity(of: path)
+                else {
+                    throw PatchError("integrity check failed: \(path) moved or changed")
+                }
             }
-        }
-        guard identical else {
-            throw PatchError("integrity check failed: bytes changed outside the patched assets")
-        }
-
-        for (entry, blob) in written {
-            let stored = patched[entry.dataOffset ..< entry.dataOffset + blob.count]
-            guard stored == blob else {
-                throw PatchError("\(entry.label): stored blob does not match what was compressed")
-            }
-            guard patched.u64(at: entry.lengthFieldOffset) == UInt64(blob.count) else {
-                throw PatchError("\(entry.label): length field does not match the stored blob")
-            }
-            _ = try Brotli.decompress(stored)
         }
 
         Log.info(
-            "integrity: \(written.count) asset(s) rewritten, \(humanBytes(gaps.reduce(0) { $0 + $1.count })) "
-                + "of the image byte-identical")
+            "integrity: \(replacements.count) file(s) rewritten, "
+                + "\(before.count - replacements.count) carried across unchanged")
     }
 
-    /// Compresses every changed asset, in parallel, each only as hard as its slot demands.
-    ///
-    /// libbrotli's encoder is single-threaded and brotli streams cannot be concatenated,
-    /// so one asset cannot be split across cores -- but the stylesheet and the script can
-    /// compress at the same time, which is most of what there is to win here.
-    private static func compressAll(_ pending: [(entry: AssetEntry, content: Data)]) throws
-        -> [(entry: AssetEntry, blob: Data)]
-    {
-        guard !pending.isEmpty else { return [] }
-
-        var results = [Result<Data, Error>?](repeating: nil, count: pending.count)
-        let lock = NSLock()
-
-        Profile.shared.measure("compress assets") {
-            DispatchQueue.concurrentPerform(iterations: pending.count) { index in
-                let item = pending[index]
-                let outcome = Result {
-                    try Brotli.compressToFit(
-                        item.content, budget: item.entry.dataLength,
-                        describedAs: item.entry.label)
-                }
-                lock.lock()
-                results[index] = outcome
-                lock.unlock()
-            }
+    /// Points Info.plist's `ElectronAsarIntegrity` at the rewritten header. With the
+    /// embedded-integrity fuse on, a stale hash kills the app as it opens app.asar.
+    private static func setAsarHeaderHash(_ hash: String, in bundle: URL) throws {
+        let url = Paths.infoPlist(in: bundle)
+        var format = PropertyListSerialization.PropertyListFormat.xml
+        guard
+            let plist = try PropertyListSerialization.propertyList(
+                from: try Data(contentsOf: url), options: .mutableContainers, format: &format)
+                as? NSMutableDictionary
+        else {
+            throw PatchError("Info.plist is not a dictionary")
         }
-
-        return try pending.indices.map { index in
-            let blob = try results[index]!.get()
-            let entry = pending[index].entry
-            Log.info(
-                "\(entry.label): \(humanBytes(pending[index].content.count)) source -> "
-                    + "\(humanBytes(blob.count)) (slot holds \(humanBytes(entry.dataLength)))")
-            return (entry, blob)
+        guard
+            let entry = (plist["ElectronAsarIntegrity"] as? NSDictionary)?["Resources/app.asar"]
+                as? NSMutableDictionary
+        else {
+            Log.debug("Info.plist has no ElectronAsarIntegrity entry; nothing to update")
+            return
         }
+        entry["hash"] = hash
+        try PropertyListSerialization.data(fromPropertyList: plist, format: format, options: 0)
+            .write(to: url, options: .atomic)
+        Log.debug("ElectronAsarIntegrity -> \(hash)")
     }
 
     // MARK: - Doctor
 
     /// Reports what the patcher can still find, without cloning, patching or signing.
-    /// With `dump`, also writes the decoded assets there, which is the raw material for
+    /// With `dump`, also writes the files it found there, which is the raw material for
     /// re-anchoring against a new release.
     static func doctor(dump: URL? = nil) throws {
-        let image = try Data(contentsOf: Paths.executable(in: Paths.source))
-        let macho = try MachOImage(image)
-
         print("Conductor \(try bundleVersion(of: Paths.source))  \(Paths.source.path)")
-        print("  pointers          \(macho.hasChainedFixups ? "chained fixups" : "classic rebases")")
+        let archive = try openArchive(in: Paths.source)
+        print("  app.asar          \(archive.files.count) files, \(humanBytes(archive.bytes.count))")
 
-        let frontend = try locate(in: image, macho: macho)
-        print("  keyed entries     \(frontend.entries.count)")
-        print("  decoded           \(frontend.decodedCount) (of \(frontend.entries.count))")
-        print("  slice fallback    \(frontend.usedFallback ? "USED" : "not needed")")
-
-        func describe(_ label: String, _ located: (entry: AssetEntry, content: Data)?) {
+        let frontend = locate(in: archive)
+        func describe(_ label: String, _ located: Frontend.Located?) {
             let padded = label.padding(toLength: 18, withPad: " ", startingAt: 0)
             guard let located else {
                 print("  \(padded)NOT FOUND")
                 return
             }
-            print("  \(padded)\(located.entry.label)  \(humanBytes(located.content.count))")
+            print("  \(padded)\(located.file.path)  \(humanBytes(located.content.count))")
         }
         describe("stylesheet", frontend.stylesheet)
         describe("main script", frontend.mainScript)
@@ -401,8 +394,7 @@ enum Pipeline {
             var written = Set<String>()
             for located in [frontend.stylesheet, frontend.mainScript, frontend.sidebarHost] {
                 guard let located else { continue }
-                let name = located.entry.key.isEmpty
-                    ? located.entry.label : (located.entry.key as NSString).lastPathComponent
+                let name = (located.file.path as NSString).lastPathComponent
                 guard written.insert(name).inserted else { continue }
                 try located.content.write(to: dump.appendingPathComponent(name))
             }
@@ -428,32 +420,53 @@ enum Pipeline {
     // MARK: - Signing
 
     /// The release's own entitlements, read from the work bundle before anything touches
-    /// it. At that point it is a pristine copy of whatever release it came from -- which,
-    /// when Conductor has just updated itself in place, is not the release in /Applications.
-    private static func captureEntitlements(of bundle: URL) -> URL? {
+    /// it, plus `disable-library-validation`.
+    ///
+    /// Read from the clone because, when Conductor has just updated itself in place, it is
+    /// a pristine copy of a release that is not the one in /Applications.
+    ///
+    /// The extra entitlement is what lets an ad-hoc main executable start at all. The
+    /// hardened runtime's library validation only admits libraries signed by Apple or by
+    /// the process's own team, an ad-hoc signature has no team, and Electron Framework --
+    /// left alone, still signed by Conductor's -- is loaded by the main executable at
+    /// launch.
+    private static func prepareEntitlements(of bundle: URL) -> URL? {
         let file = Paths.workDirectory.appendingPathComponent("entitlements.plist")
         try? FileManager.default.removeItem(at: file)
         do {
             try run("/usr/bin/codesign", ["-d", "--entitlements", file.path, "--xml", bundle.path])
+            let entitlements =
+                (FileManager.default.fileExists(atPath: file.path)
+                    ? try PropertyListSerialization.propertyList(
+                        from: Data(contentsOf: file), format: nil) as? [String: Any]
+                    : nil) ?? [:]
+            var amended = entitlements
+            amended["com.apple.security.cs.disable-library-validation"] = true
+            try PropertyListSerialization.data(fromPropertyList: amended, format: .xml, options: 0)
+                .write(to: file)
+            Log.debug("entitlements: \(amended.keys.sorted().joined(separator: ", "))")
+            return file
         } catch {
             Log.warn("could not read entitlements from \(bundle.path): \(error)")
             return nil
         }
-        return FileManager.default.fileExists(atPath: file.path) ? file : nil
     }
 
-    /// Ad-hoc re-sign, carrying the original entitlements and hardened runtime across.
+    /// Ad-hoc re-sign of the bundle's own code and resource seal.
     ///
-    /// Unavoidable: touching a byte of the executable invalidates Conductor's Developer ID
-    /// signature, and macOS will not run an arm64 binary whose signature does not verify.
-    /// Deliberately not `--deep` -- the sidecars in Resources/bin (gh, watchexec,
-    /// conductor-runtime) keep their own valid signatures and are only sealed by hash.
+    /// Unavoidable: app.asar and Info.plist are both sealed by Conductor's Developer ID
+    /// signature. Deliberately not `--deep` -- the helper apps, Electron Framework, the
+    /// native server and the sidecars in Resources/bin keep their own valid signatures and
+    /// are only sealed by hash.
+    ///
+    /// Without recovered entitlements the hardened runtime is left off rather than applied
+    /// bare: without `allow-jit` V8 cannot run under it.
     private static func sign(entitlements: URL?) throws {
-        var arguments = ["--force", "--sign", "-", "--options", "runtime"]
+        var arguments = ["--force", "--sign", "-"]
         if let entitlements {
-            arguments += ["--entitlements", entitlements.path]
+            arguments += ["--options", "runtime", "--entitlements", entitlements.path]
         } else {
-            Log.warn("no entitlements recovered; signing without")
+            Log.warn("no entitlements recovered; signing without the hardened runtime")
         }
         arguments.append(Paths.work.path)
 
@@ -461,6 +474,47 @@ enum Pipeline {
         try Profile.shared.measure("codesign --verify") {
             try run("/usr/bin/codesign", ["--verify", "--strict", Paths.work.path])
         }
-        Log.info("signed ad-hoc, hardened runtime preserved")
+        Log.info(
+            entitlements == nil
+                ? "signed ad-hoc" : "signed ad-hoc, hardened runtime and entitlements preserved")
+    }
+}
+
+// MARK: - Rollback
+
+/// The shipped copies of the files `install` overwrites, so a failure part-way through
+/// can put them back. Each is cloned aside before anything is written, which on APFS costs
+/// nothing until the original is replaced.
+private struct Rollback {
+    private let saved: [(original: URL, copy: URL)]
+    private let directory: URL
+
+    init(saving files: [URL]) throws {
+        directory = Paths.workDirectory.appendingPathComponent("rollback", isDirectory: true)
+        let manager = FileManager.default
+        try? manager.removeItem(at: directory)
+        try manager.createDirectory(at: directory, withIntermediateDirectories: true)
+
+        var saved: [(URL, URL)] = []
+        for (index, file) in files.enumerated() where manager.fileExists(atPath: file.path) {
+            let copy = directory.appendingPathComponent("\(index)-\(file.lastPathComponent)")
+            guard clonefile(file.path, copy.path, 0) == 0 else {
+                throw PatchError(
+                    "could not save \(file.path) for rollback: " + String(cString: strerror(errno)))
+            }
+            saved.append((file, copy))
+        }
+        self.saved = saved
+    }
+
+    func restore() {
+        for (original, copy) in saved where rename(copy.path, original.path) != 0 {
+            Log.warn("could not restore \(original.path): \(String(cString: strerror(errno)))")
+        }
+        discard()
+    }
+
+    func discard() {
+        try? FileManager.default.removeItem(at: directory)
     }
 }

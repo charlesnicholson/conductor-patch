@@ -1,10 +1,9 @@
 #!/bin/sh
 # Build "Conductor QoL Patched.app".
 #
-# The only external ingredient is brotli, which envy fetches and builds as static
-# archives; everything else the tool uses ships with macOS. The result links against
-# libSystem, Foundation, AppKit and the OS Swift runtime and nothing else, so it runs on
-# any Mac without envy, Homebrew or this checkout.
+# No dependencies beyond Xcode: the tool links against libSystem, Foundation, AppKit,
+# CryptoKit and the OS Swift runtime and nothing else, so it runs on any Mac without
+# Homebrew or this checkout.
 #
 #   ./build.sh              build into out/
 #   ./build.sh --install    build, then install into /Applications
@@ -26,25 +25,13 @@ for argument in "$@"; do
     esac
 done
 
-echo "==> envy sync"
-"$ROOT/bin/envy" sync
-
-BROTLI_INCLUDE=$("$ROOT/bin/envy" product brotli_include_dir | tail -1)
-BROTLI_LIB=$("$ROOT/bin/envy" product brotli_lib_dir | tail -1)
-[ -f "$BROTLI_INCLUDE/brotli/encode.h" ] || { echo "no brotli headers at $BROTLI_INCLUDE" >&2; exit 1; }
-[ -f "$BROTLI_LIB/libbrotlienc.a" ] || { echo "no brotli archives at $BROTLI_LIB" >&2; exit 1; }
-
 echo "==> swiftc"
 mkdir -p "$OUT"
 xcrun swiftc \
     -O -swift-version 5 \
     -target arm64-apple-macos13.0 \
     -import-objc-header "$ROOT/src/shim.h" \
-    -I "$BROTLI_INCLUDE" \
     -framework AppKit \
-    "$BROTLI_LIB/libbrotlienc.a" \
-    "$BROTLI_LIB/libbrotlidec.a" \
-    "$BROTLI_LIB/libbrotlicommon.a" \
     -o "$OUT/$EXECUTABLE" \
     "$ROOT"/src/*.swift
 
