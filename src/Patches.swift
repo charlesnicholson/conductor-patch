@@ -24,14 +24,14 @@ enum Patches {
         var qualifyRepoNames = true
     }
 
-    /// Anchors used to identify assets by content rather than by filename.
+    /// Identifies the Tailwind stylesheet among the frontend's CSS files by content
+    /// rather than by its hashed filename.
     ///
     /// Deliberately unrelated to anything a patch edits. An earlier version located the
     /// script by the same string the sidebar patch anchors on, which meant that patch
     /// going stale took the whole tool down with it instead of degrading to "one feature
     /// missing". Locating and patching are now independent failures.
-    static let stylesheetAnchors = ["@layer utilities", "--tw-", ":root{"]
-    static let scriptAnchors = ["react.memo_cache_sentinel", "useSyncExternalStore"]
+    static let stylesheetAnchor = "@layer utilities"
 
     /// Anchor for the sidebar patch specifically. Used to narrow the regex window, not to
     /// decide which asset is the script.
@@ -55,10 +55,11 @@ enum Patches {
         let selector: String
         /// The declaration body, without braces.
         let declarations: String
-        /// Class tokens that must still co-occur in one className literal in the bundle.
-        /// Not needed to apply the rule -- appending always succeeds -- but without this
-        /// the patch could silently stop matching anything and just look wrong.
-        let evidence: [String]
+        /// One set of class tokens per element the selector names; each set must still
+        /// co-occur in some className literal in the bundle. Not needed to apply the rule
+        /// -- appending always succeeds -- but without this the patch could silently stop
+        /// matching anything and just look wrong.
+        let evidence: [[String]]
         /// Extra literals that must appear anywhere in the bundle.
         let literals: [String]
     }
@@ -68,19 +69,21 @@ enum Patches {
         StyleRule(
             name: "session columns", selector: ".max-w-4xl.mx-auto.px-7",
             declarations: "max-width:none",
-            evidence: ["max-w-4xl", "mx-auto", "px-7"], literals: []),
-        // Composer, local and cloud workspaces.
+            evidence: [["max-w-4xl", "mx-auto", "px-7"]], literals: []),
+        // Composer. Until 0.94 its column also carried `pointer-events-auto`, and the rule
+        // required it; from 0.95 the column is plain `max-w-4xl mx-auto relative`, the only
+        // element with those three classes.
         StyleRule(
-            name: "composer", selector: ".max-w-4xl.mx-auto.relative.pointer-events-auto",
+            name: "composer", selector: ".max-w-4xl.mx-auto.relative",
             declarations: "max-width:none",
-            evidence: ["max-w-4xl", "mx-auto", "relative", "pointer-events-auto"], literals: []),
+            evidence: [["max-w-4xl", "mx-auto", "relative"]], literals: []),
         // Per-turn wrapper. Anchored on the data attribute rather than `.pb-3.max-w-4xl
         // .mx-auto`, which also matches the workspace-list and routines page headers --
         // and a semantic attribute churns far less than a utility class.
         StyleRule(
             name: "turns", selector: "[data-turn-index].max-w-4xl",
             declarations: "max-width:none",
-            evidence: ["max-w-4xl", "mx-auto"], literals: ["data-turn-index"]),
+            evidence: [["max-w-4xl", "mx-auto"]], literals: ["data-turn-index"]),
         // The one-line preview on a collapsed tool row -- Thinking, Bash, Error and the
         // rest. It ships with a literal `max-w-[400px]`, so previews ellipsised a third of
         // the way across the panel however wide the window was, which is the same
@@ -100,13 +103,16 @@ enum Patches {
             name: "tool row preview",
             selector: #".font-mono.font-medium.text-xs.truncate.max-w-\[400px\]"#,
             declarations: "max-width:none;flex:1 1 0%;min-width:0",
-            evidence: ["font-mono", "font-medium", "text-xs", "truncate", "max-w-[400px]"],
+            evidence: [["font-mono", "font-medium", "text-xs", "truncate", "max-w-[400px]"]],
             literals: []),
-        // Scroll-to-bottom bar.
+        // Scroll-to-bottom button. From 0.95 the button is portalled into a bare
+        // `max-w-4xl mx-auto` column -- a class pair shared with the "load older turns"
+        // header, so the rule is pinned to the column's distinctive overlay parent.
         StyleRule(
-            name: "scroll-to-bottom", selector: ".pb-2.px-4.max-w-4xl.mx-auto",
+            name: "scroll-to-bottom", selector: ".absolute.inset-x-0.bottom-0.px-4>.max-w-4xl.mx-auto",
             declarations: "max-width:none",
-            evidence: ["pb-2", "px-4", "max-w-4xl", "mx-auto"], literals: []),
+            evidence: [["absolute", "inset-x-0", "bottom-0", "px-4"], ["max-w-4xl", "mx-auto"]],
+            literals: []),
     ]
 
     static let bubbleRules: [StyleRule] = [
@@ -116,7 +122,7 @@ enum Patches {
         StyleRule(
             name: "message bubbles", selector: #".max-w-xl.lg\:max-w-3xl"#,
             declarations: "max-width:none",
-            evidence: ["max-w-xl", "lg:max-w-3xl"], literals: []),
+            evidence: [["max-w-xl", "lg:max-w-3xl"]], literals: []),
     ]
 
     /// Every style rule, for reporting.
@@ -167,17 +173,22 @@ enum Patches {
         return outcomes
     }
 
-    /// True when some className literal in the bundle still carries all of a rule's tokens.
+    /// True when, for each element the rule's selector names, some className literal in
+    /// the bundle still carries all of that element's tokens.
     static func evidenceFound(for rule: StyleRule, in script: Data) -> Bool {
-        for literal in rule.literals where script.occurrences(of: Data(literal.utf8)).isEmpty {
+        for literal in rule.literals where script.range(of: Data(literal.utf8)) == nil {
             return false
         }
-        guard let rarest = rule.evidence.min(by: { left, right in
+        return rule.evidence.allSatisfy { classLiteralExists(with: $0, in: script) }
+    }
+
+    private static func classLiteralExists(with tokens: [String], in script: Data) -> Bool {
+        guard let rarest = tokens.min(by: { left, right in
             script.occurrences(of: Data(left.utf8)).count
                 < script.occurrences(of: Data(right.utf8)).count
         }) else { return true }
 
-        let wanted = Set(rule.evidence)
+        let wanted = Set(tokens)
         for hit in script.occurrences(of: Data(rarest.utf8)) {
             guard let literal = enclosingStringLiteral(at: hit, in: script) else { continue }
             if wanted.isSubset(of: Set(literal.split(separator: " ").map(String.init))) {
@@ -300,7 +311,7 @@ enum Patches {
 
     // MARK: - Idempotence
 
-    static func alreadyPatched(_ blob: Data) -> Bool {
-        !blob.occurrences(of: Data(marker.utf8)).isEmpty
+    static func alreadyPatched(_ content: Data) -> Bool {
+        content.range(of: Data(marker.utf8)) != nil
     }
 }

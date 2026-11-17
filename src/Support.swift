@@ -128,9 +128,8 @@ final class Profile {
 
 // MARK: - Little-endian scalar access
 //
-// The Mach-O structures and the asset table are all packed little-endian, and none of the
-// fields are guaranteed aligned once you are indexing into a byte image, hence
-// loadUnaligned throughout.
+// The asar header is packed little-endian, and nothing in it is guaranteed aligned once
+// you are indexing into a byte image, hence loadUnaligned.
 
 extension Data {
     func u32(at offset: Int) -> UInt32 {
@@ -138,28 +137,6 @@ extension Data {
         return withUnsafeBytes {
             UInt32(littleEndian: $0.loadUnaligned(fromByteOffset: offset, as: UInt32.self))
         }
-    }
-
-    func u64(at offset: Int) -> UInt64 {
-        precondition(offset >= 0 && offset + 8 <= count, "u64 out of bounds")
-        return withUnsafeBytes {
-            UInt64(littleEndian: $0.loadUnaligned(fromByteOffset: offset, as: UInt64.self))
-        }
-    }
-
-    mutating func setU64(_ value: UInt64, at offset: Int) {
-        precondition(offset >= 0 && offset + 8 <= count, "setU64 out of bounds")
-        var le = value.littleEndian
-        Swift.withUnsafeBytes(of: &le) { source in
-            replaceSubrange(offset ..< offset + 8, with: source)
-        }
-    }
-
-    /// A fixed-width C string field, as Mach-O uses for segment and section names.
-    func cString(at offset: Int, maxLength: Int) -> String {
-        let slice = self[offset ..< offset + maxLength]
-        let bytes = Array(slice.prefix { $0 != 0 })
-        return String(decoding: bytes, as: UTF8.self)
     }
 }
 
@@ -188,11 +165,11 @@ func run(_ executable: String, _ arguments: [String], quiet: Bool = true) throws
     return output
 }
 
-// MARK: - Byte-level search and replace
+// MARK: - Byte-level search
 //
 // Everything the patcher edits is minified JS or CSS, so the edits are literal byte
 // substitutions on UTF-8. Working in Data rather than String avoids paying grapheme
-// breaking on an 11 MB buffer for no benefit.
+// breaking on a 12 MB buffer for no benefit.
 
 extension Data {
     func occurrences(of needle: Data, in searchRange: Range<Int>? = nil) -> [Int] {
@@ -204,27 +181,6 @@ extension Data {
             cursor = hit.lowerBound + 1
         }
         return found
-    }
-
-    /// Replaces every occurrence of `needle`, requiring exactly `expected` of them.
-    /// A miscount means the bundle moved under us, which must abort rather than
-    /// half-apply: `context` names the edit in the error.
-    mutating func replaceAll(
-        _ needle: String, with replacement: String, expected: Int, context: String
-    ) throws {
-        let needleData = Data(needle.utf8)
-        let hits = occurrences(of: needleData)
-        guard hits.count == expected else {
-            throw PatchError(
-                "\(context): expected \(expected) occurrence(s) of \(needle.debugDescription), "
-                    + "found \(hits.count). Conductor's bundle has changed; the patch needs "
-                    + "re-anchoring.")
-        }
-        let replacementData = Data(replacement.utf8)
-        for start in hits.reversed() {
-            replaceSubrange(start ..< start + needleData.count, with: replacementData)
-        }
-        Log.debug("\(context): replaced \(hits.count)x \(needle.debugDescription)")
     }
 }
 

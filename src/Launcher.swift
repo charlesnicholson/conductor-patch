@@ -49,22 +49,29 @@ enum Launcher {
         kill(pid, 0) == 0 || errno == EPERM
     }
 
-    /// Whether `pid` is still a Conductor -- for a process whose executable has been
-    /// renamed or deleted underneath it, which is what the updater does to the instance
-    /// it is replacing. Guards against a recycled PID before anything is signalled.
+    /// Whether `pid` is still Conductor's main process -- for a process whose executable
+    /// has been renamed or deleted underneath it, which is what the updater does to the
+    /// instance it is replacing. Guards against a recycled PID before anything is signalled.
     ///
     /// The updater renames the old bundle to `current_app` inside a temporary directory
     /// before deleting it, so `proc_pidpath` reports `.../current_app/Contents/MacOS/
-    /// conductor` for a while and then nothing at all; only the executable's own name is
+    /// Conductor` for a while and then nothing at all; only the executable's own name is
     /// stable across both, and `proc_name` still knows it after the file is gone.
+    ///
+    /// Case-insensitive because the Tauri builds named the executable `conductor` and the
+    /// Electron builds `Conductor`, and an update can cross between them. The helpers
+    /// (`Conductor Helper (Renderer)` and friends) and the native server are deliberately
+    /// not matched: they belong to the main process and go when it does.
     static func isConductor(_ pid: pid_t) -> Bool {
         guard isAlive(pid) else { return false }
-        if let path = executablePath(of: pid), path.hasSuffix("/Contents/MacOS/conductor") {
+        if let path = executablePath(of: pid),
+            path.lowercased().hasSuffix("/contents/macos/conductor")
+        {
             return true
         }
         var name = [CChar](repeating: 0, count: 256)
         guard proc_name(pid, &name, UInt32(name.count)) > 0 else { return false }
-        return String(cString: name) == "conductor"
+        return String(cString: name).lowercased() == "conductor"
     }
 
     /// True when anything at all is executing out of the source install. Two Conductors
@@ -177,8 +184,9 @@ enum Launcher {
     /// After the updater has installed a release into the clone: waits for the instance it
     /// is replacing to exit, then reports whether a new instance appeared in the clone.
     ///
-    /// Tauri's restart is "spawn the executable at the path we started from, then exit",
-    /// so a relaunch shows up within a moment of the old instance going. Nothing appearing
+    /// Conductor's restart is "spawn the executable at the path we started from once this
+    /// process has exited", so a relaunch shows up within a moment of the old instance
+    /// going. Nothing appearing
     /// means the user quit instead -- Conductor offers both -- and the session is over.
     /// The wait for the old instance is open-ended, because Conductor may sit on an
     /// installed update until the user chooses to restart.
@@ -200,26 +208,39 @@ enum Launcher {
         return false
     }
 
-    /// SIGTERM everything running from the work bundle, plus any of `also` that is still a
-    /// Conductor, escalating if it does not go quietly. `also` is for the instance an
-    /// update has moved out from under the path check; it is filtered by name so a
+    /// Shuts down everything running from the work bundle, plus any of `also` that is
+    /// still a Conductor, escalating if it does not go quietly. `also` is for the instance
+    /// an update has moved out from under the path check; it is filtered by name so a
     /// recycled PID is never signalled.
+    ///
+    /// The main process is asked first and on its own. Conductor treats SIGTERM as a quit:
+    /// it stops the native server and its helpers itself, and signalling those at the same
+    /// time only races that cleanup. Whatever is left after half the timeout is signalled
+    /// directly, then killed.
     static func terminateAll(also: Set<pid_t> = [], timeout: TimeInterval = 10.0) {
         func targets() -> Set<pid_t> {
             Set(processes(under: Paths.work)).union(also.filter(isConductor))
         }
 
+        func signalAndWait(_ pids: Set<pid_t>, _ signal: Int32, for seconds: TimeInterval) -> Bool {
+            for pid in pids { kill(pid, signal) }
+            let deadline = Date().addingTimeInterval(seconds)
+            while Date() < deadline {
+                if targets().isEmpty { return true }
+                Thread.sleep(forTimeInterval: 0.25)
+            }
+            return false
+        }
+
         let running = targets()
         guard !running.isEmpty else { return }
 
+        let main = running.filter(isConductor)
         Log.info("asking Conductor to quit (\(running.count) process(es))")
-        for pid in running { kill(pid, SIGTERM) }
+        if signalAndWait(main.isEmpty ? running : main, SIGTERM, for: timeout / 2) { return }
 
-        let deadline = Date().addingTimeInterval(timeout)
-        while Date() < deadline {
-            if targets().isEmpty { return }
-            Thread.sleep(forTimeInterval: 0.25)
-        }
+        let stragglers = targets()
+        if signalAndWait(stragglers, SIGTERM, for: timeout / 2) { return }
 
         let survivors = targets()
         if !survivors.isEmpty {
@@ -264,7 +285,7 @@ enum Launcher {
     /// deleted on every launch, and /Applications would never move.
     ///
     /// Must not be called while anything runs from the work bundle: the move takes the
-    /// executable and sidecars away from under it.
+    /// executable and helpers away from under it.
     @discardableResult
     static func adoptUpdateIfPresent() -> Bool {
         guard let versions = newerRelease() else { return false }

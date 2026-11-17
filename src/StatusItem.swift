@@ -3,8 +3,8 @@ import Foundation
 
 /// Menu-bar presence for the agent (LSUIElement) mode.
 ///
-/// The patch takes ~15 s before Conductor's window appears, and this process then stays
-/// alive for the whole session to own teardown. Both facts need to be visible somewhere,
+/// The patch takes a moment before Conductor's window appears, and this process then
+/// stays alive for the whole session to own teardown. Both facts need to be visible somewhere,
 /// and a status item is the least intrusive place: progress while patching, then a quiet
 /// indicator with a Quit that shuts Conductor down cleanly and removes the clone.
 final class StatusItemController: NSObject {
